@@ -302,42 +302,45 @@ def process_task(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Apply descriptions back to markdown files (one write per file)
+# Apply a single description to its markdown file immediately
 # ─────────────────────────────────────────────────────────────────────────────
-def apply_descriptions(
-    results: list[tuple[ImageTask, str | None]], dry_run: bool
-) -> int:
-    from collections import defaultdict
-    by_file: dict[Path, list[tuple[ImageTask, str]]] = defaultdict(list)
-    for task, desc in results:
-        if desc is not None:
-            by_file[task.md_path].append((task, desc))
+# Per-file lock to prevent concurrent writes to the same .md
+_file_locks: dict[str, Lock] = {}
+_file_locks_lock = Lock()
 
-    written = 0
-    for md_path, file_results in by_file.items():
-        text = md_path.read_text(encoding="utf-8", errors="replace")
-        modified = False
 
-        for task, description in file_results:
-            if task.full_match not in text:
-                continue
-            short_title = description.split(".")[0].strip()[:120]
-            enriched_alt = short_title if not task.alt_text else task.alt_text
-            replacement = (
-                f"<!-- IMAGE_DESCRIPTION: {task.img_ref}\n"
-                f"{description}\n"
-                f"-->\n"
-                f"![{enriched_alt}]({task.img_ref})"
-            )
-            text = text.replace(task.full_match, replacement, 1)
-            modified = True
-            written += 1
+def _get_file_lock(path: Path) -> Lock:
+    key = str(path)
+    with _file_locks_lock:
+        if key not in _file_locks:
+            _file_locks[key] = Lock()
+        return _file_locks[key]
 
-        if modified and not dry_run:
-            shutil.copy2(md_path, md_path.with_suffix(".md.bak"))
-            md_path.write_text(text, encoding="utf-8")
 
-    return written
+def apply_single_description(task: ImageTask, description: str) -> bool:
+    """Write one image caption to its .md file immediately. Thread-safe."""
+    lock = _get_file_lock(task.md_path)
+    with lock:
+        text = task.md_path.read_text(encoding="utf-8", errors="replace")
+        if task.full_match not in text:
+            return False
+
+        # Create backup on first write
+        bak = task.md_path.with_suffix(".md.bak")
+        if not bak.exists():
+            shutil.copy2(task.md_path, bak)
+
+        short_title = description.split(".")[0].strip()[:120]
+        enriched_alt = short_title if not task.alt_text else task.alt_text
+        replacement = (
+            f"<!-- IMAGE_DESCRIPTION: {task.img_ref}\n"
+            f"{description}\n"
+            f"-->\n"
+            f"![{enriched_alt}]({task.img_ref})"
+        )
+        text = text.replace(task.full_match, replacement, 1)
+        task.md_path.write_text(text, encoding="utf-8")
+        return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,6 +361,8 @@ def main() -> None:
                         help="OpenRouter API key. Alternatively set OPENROUTER_API_KEY env var.")
     parser.add_argument("--glob", default="**/*.md",
                         help="Glob pattern for markdown files (default: **/*.md).")
+    parser.add_argument("--year-from", type=int, default=None,
+                        help="Only process docs from this year onwards (e.g. 2020).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Discover and report tasks without calling APIs or writing files.")
     parser.add_argument("--progress-every", type=int, default=100,
@@ -387,6 +392,17 @@ def main() -> None:
     md_files = sorted(docs_dir.glob(args.glob))
     if not md_files:
         sys.exit(f"No markdown files found with '{args.glob}' in {docs_dir}")
+
+    # Filter by year if requested (expects paths like YEAR/month/day/slug/index.md)
+    if args.year_from is not None:
+        md_files = [
+            f for f in md_files
+            if f.relative_to(docs_dir).parts[0].isdigit()
+            and int(f.relative_to(docs_dir).parts[0]) >= args.year_from
+        ]
+        if not md_files:
+            sys.exit(f"No markdown files found from year {args.year_from} onwards")
+
     log.info(f"Markdown files: {len(md_files):,}")
 
     log.info("Scanning for image references...")
@@ -414,10 +430,10 @@ def main() -> None:
         log.info("[DRY-RUN] No API calls made, no files written.")
         return
 
-    # ── Process ──────────────────────────────────────────────────────────────
-    results: list[tuple[ImageTask, str | None]] = []
-    done_count = 0
+    # ── Process + write incrementally ────────────────────────────────────────
+    written = 0
     error_count = 0
+    consecutive_402 = 0
     t_start = time.time()
 
     def _run(task: ImageTask) -> tuple[ImageTask, str | None]:
@@ -427,14 +443,25 @@ def main() -> None:
         futures = {pool.submit(_run, t): t for t in tasks}
         for future in as_completed(futures):
             task, desc = future.result()
-            results.append((task, desc))
 
             if desc is None:
                 error_count += 1
+                # Check if it's a 402 (credits exhausted)
+                consecutive_402 += 1
+                if consecutive_402 >= 20:
+                    log.warning(
+                        f"{consecutive_402} consecutive errors — likely credits exhausted. "
+                        f"Stopping early. {written:,} images already saved."
+                    )
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
             else:
-                done_count += 1
+                consecutive_402 = 0
+                # Write immediately to disk
+                if apply_single_description(task, desc):
+                    written += 1
 
-            total_done = done_count + error_count
+            total_done = written + error_count
             if total_done % args.progress_every == 0:
                 elapsed = time.time() - t_start
                 rate = total_done / elapsed if elapsed > 0 else 0
@@ -442,17 +469,14 @@ def main() -> None:
                 log.info(
                     f"Progress: {total_done:,}/{len(tasks):,} | "
                     f"{rate:.1f} img/s | ETA ~{remaining/60:.0f} min | "
-                    f"errors: {error_count}"
+                    f"saved: {written:,} | errors: {error_count}"
                 )
 
-    # ── Write ────────────────────────────────────────────────────────────────
-    log.info("Writing enriched markdown files...")
-    written = apply_descriptions(results, dry_run=False)
-
+    # ── Done ─────────────────────────────────────────────────────────────────
     elapsed = time.time() - t_start
     log.info(
         f"\n✅ Done in {elapsed/60:.1f} min — "
-        f"{written:,} images captioned | "
+        f"{written:,} images captioned (saved to disk) | "
         f"{error_count} errors"
     )
 
