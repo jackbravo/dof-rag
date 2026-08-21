@@ -293,6 +293,46 @@ class AgentExecutorConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._config(DOF_RETRIEVAL_MODE="weird")
 
+    def test_accepts_llama_server_provider(self):
+        config = self._config(DOF_AGENT_PROVIDER="llama-server")
+        self.assertEqual(config.provider, "llama-server")
+
+    def test_rejects_unknown_provider(self):
+        with self.assertRaisesRegex(ValueError, "DOF_AGENT_PROVIDER"):
+            self._config(DOF_AGENT_PROVIDER="weird")
+
+    def test_llama_server_backend_uses_local_openai_compatible_endpoint(self):
+        executor = AgentRunExecutor(
+            AgentExecutorConfig(
+                repo_root=self.root,
+                provider="llama-server",
+                model="ornith",
+                corpus_db=self.root / "missing-corpus.sqlite",
+                chunks_db=self.root / "missing-chunks.sqlite",
+            )
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            backend = executor._backend()
+        self.assertEqual(backend.model, "ornith")
+        self.assertEqual(
+            str(backend.client.base_url), "http://127.0.0.1:8080/v1/"
+        )
+
+    def test_llama_server_backend_honors_base_url_override(self):
+        executor = AgentRunExecutor(
+            AgentExecutorConfig(
+                repo_root=self.root,
+                provider="llama-server",
+                model="ornith",
+                corpus_db=self.root / "missing-corpus.sqlite",
+                chunks_db=self.root / "missing-chunks.sqlite",
+                base_url="http://127.0.0.1:9999/v1/",
+            )
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            backend = executor._backend()
+        self.assertEqual(str(backend.client.base_url), "http://127.0.0.1:9999/v1/")
+
     def test_non_lexical_mode_requires_existing_vector_index(self):
         with self.assertRaisesRegex(ValueError, "vector index"):
             self._config(DOF_RETRIEVAL_MODE="hybrid")

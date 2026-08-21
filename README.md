@@ -154,18 +154,32 @@ El corpus completo ya está construido: 657,867 documentos, 6.73 millones de chu
   ```
 
   Reporte en `reports/eval_v4_retrieval.md` y resultados deterministas versionados en `eval/cache/eval_v4_full_comparison.json`. Resultado final: la fusión híbrida supera a BM25 puro (MRR 0.339 contra 0.221; all-hop@20 0.595 contra 0.429).
-- Evaluación del agente completo: `uv run python scripts/eval_v4_agent.py --provider kimi-code --model kimi-for-coding`.
+- Evaluación del agente completo: `uv run python scripts/eval_v4_agent.py --provider kimi-code --model kimi-for-coding` (también `--provider llama-server --model <id>` contra un servidor local OpenAI-compatible, por defecto `http://127.0.0.1:8080/v1`).
 
 ## Sitio de evaluación humana
 
 Aplicación web (Air + Clerk) en `human_eval/` para que personas formulen preguntas reales al agente y evalúen las respuestas.
 
+El modo de recuperación por defecto es `hybrid` (índice vec0 + embeddings GGUF). Si solo quieres búsqueda léxica, usa `DOF_RETRIEVAL_MODE=lexical`.
+
 ```bash
 set -a; source .env; set +a  # CLERK_* y DOF_SESSION_SECRET (nunca imprimir valores)
 export DOF_AGENT_PROVIDER=kimi-code DOF_AGENT_MODEL=kimi-for-coding \
-  DOF_RETRIEVAL_MODE=lexical DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
+  DOF_RETRIEVAL_MODE=hybrid DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
 uv run python -m human_eval.app  # http://127.0.0.1:8765
 ```
+
+También se puede usar un modelo local a través de cualquier servidor OpenAI-compatible (llama.cpp `llama-server`, LM Studio, vLLM, ...). Por ejemplo, con `llama-server` sirviendo `qwen3.8` en `http://127.0.0.1:8080/` (verifica el id con `curl -s localhost:8080/v1/models`):
+
+```bash
+set -a; source .env; set +a
+export DOF_AGENT_PROVIDER=llama-server DOF_AGENT_MODEL=qwen3.8 \
+  DOF_RETRIEVAL_MODE=hybrid DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
+uv run python -m human_eval.app
+```
+
+- `DOF_AGENT_PROVIDER=llama-server` usa el endpoint de Chat Completions de `DOF_AGENT_BASE_URL` (por defecto `http://127.0.0.1:8080/v1`). No requiere API key; si la sirves con autenticación, pásala por `DOF_AGENT_API_KEY`.
+- El modelo de chat local (puerto 8080) es independiente del llama-server de embeddings que levanta el modo `hybrid` (`DOF_EMBED_PORT`, por defecto 8086): pueden correr a la vez.
 
 - Visitantes anónimos leen las respuestas publicadas. Con cuenta: 1 pregunta cada 24 h (`DOF_DAILY_QUESTION_LIMIT`) y hay que evaluar una respuesta publicada antes de cada pregunta, incluida la primera. Los administradores publican y despublican en `/admin/queue` (rol vía `public_metadata.role = "admin"` en el dashboard de Clerk).
 - Recuperación híbrida para preguntas en vivo: `DOF_RETRIEVAL_MODE=hybrid` (requiere el índice vec0 y `DOF_GGUF_MODEL`; el servidor de embeddings llama-server se levanta una sola vez por proceso, con `DOF_EMBED_PORT`, por defecto 8086).

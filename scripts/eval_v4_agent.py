@@ -158,7 +158,7 @@ def main() -> int:
     parser.add_argument("--queries", default="eval/dof_queries_v4.jsonl")
     parser.add_argument(
         "--provider",
-        choices=["openai-responses", "kimi-code"],
+        choices=["openai-responses", "kimi-code", "llama-server"],
         default="openai-responses",
     )
     selection = parser.add_mutually_exclusive_group()
@@ -220,7 +220,13 @@ def main() -> int:
         )
         return payload
 
-    if args.provider == "kimi-code":
+    if args.provider == "llama-server":
+        backend = OpenAIChatCompletionsBackend(
+            model=args.model,
+            api_key=os.environ.get("DOF_AGENT_API_KEY", "llama-server"),
+            base_url=args.base_url or "http://127.0.0.1:8080/v1",
+        )
+    elif args.provider == "kimi-code":
         api_key = os.environ.get("KIMI_API_KEY", "")
         if not api_key:
             parser.error("kimi-code provider requires KIMI_API_KEY")

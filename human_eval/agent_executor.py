@@ -47,8 +47,11 @@ class AgentExecutorConfig:
     def from_env(cls, repo_root: str | Path) -> "AgentExecutorConfig":
         root = Path(repo_root).resolve()
         provider = os.environ.get("DOF_AGENT_PROVIDER", "openai-responses")
-        if provider not in {"openai-responses", "kimi-code"}:
-            raise ValueError("DOF_AGENT_PROVIDER must be openai-responses or kimi-code")
+        if provider not in {"openai-responses", "kimi-code", "llama-server"}:
+            raise ValueError(
+                "DOF_AGENT_PROVIDER must be openai-responses, kimi-code, "
+                "or llama-server"
+            )
         model = os.environ.get("DOF_AGENT_MODEL", os.environ.get("OPENAI_MODEL", ""))
         if not model:
             raise ValueError("set DOF_AGENT_MODEL or OPENAI_MODEL")
@@ -222,6 +225,15 @@ class AgentRunExecutor:
         }
 
     def _backend(self) -> Any:
+        if self.config.provider == "llama-server":
+            # Any OpenAI-compatible local server (llama.cpp llama-server,
+            # LM Studio, vLLM, ...). The API key is ignored by llama-server;
+            # the placeholder only satisfies the OpenAI client.
+            return OpenAIChatCompletionsBackend(
+                model=self.config.model,
+                api_key=os.environ.get("DOF_AGENT_API_KEY", "llama-server"),
+                base_url=self.config.base_url or "http://127.0.0.1:8080/v1",
+            )
         if self.config.provider == "kimi-code":
             api_key = os.environ.get("KIMI_API_KEY", "")
             if not api_key:
