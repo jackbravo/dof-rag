@@ -317,6 +317,7 @@ class AgentExecutorConfigTests(unittest.TestCase):
         self.assertEqual(
             str(backend.client.base_url), "http://127.0.0.1:8080/v1/"
         )
+        self.assertEqual(backend.reasoning_effort, "low")
 
     def test_llama_server_backend_honors_base_url_override(self):
         executor = AgentRunExecutor(
@@ -362,6 +363,25 @@ class AgentExecutorConfigTests(unittest.TestCase):
         self.assertEqual(config.vec0_db, vec0)
         self.assertEqual(config.gguf_model, gguf)
         self.assertEqual(config.embed_port, 9999)
+
+    def test_rejects_invalid_embedding_port(self):
+        with self.assertRaisesRegex(ValueError, "DOF_EMBED_PORT"):
+            self._config(DOF_EMBED_PORT="0")
+
+    def test_rejects_shared_local_chat_and_embedding_port(self):
+        vec0_dir = self.root.resolve() / "dof_db"
+        vec0_dir.mkdir()
+        (vec0_dir / "dof_vec0_jina_binary.sqlite").touch()
+        gguf = self.root / "model.gguf"
+        gguf.touch()
+        with self.assertRaisesRegex(ValueError, "different local ports"):
+            self._config(
+                DOF_AGENT_PROVIDER="llama-server",
+                DOF_RETRIEVAL_MODE="hybrid",
+                DOF_GGUF_MODEL=str(gguf),
+                DOF_AGENT_BASE_URL="http://127.0.0.1:8080/v1",
+                DOF_EMBED_PORT="8080",
+            )
 
 
 class AgentExecutorEmbedderTests(unittest.TestCase):

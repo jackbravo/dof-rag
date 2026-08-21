@@ -7,11 +7,13 @@ LLM. Public methods map directly to the small tools exposed to an agent, while
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import math
 import re
 import sqlite3
+import threading
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
@@ -206,20 +208,49 @@ class LlamaQueryEmbedder:
     """Keep one local llama-server alive for an interactive session."""
 
     def __init__(self, gguf: Path, *, port: int = 8086, ctx: int = 8192):
-        from corpus_store.embed import start_server
+        from corpus_store.embed import (
+            DIMS,
+            PREFIX_QUERY,
+            embed_batch,
+            start_server,
+            stop_server,
+        )
 
         self.port = port
-        self.process = start_server(gguf, ctx=ctx, port=port)
+        self._lock = threading.Lock()
+        self._closed = False
+        process = start_server(gguf, ctx=ctx, port=port)
+        try:
+            probe = embed_batch([PREFIX_QUERY + "probe"], port)
+            if probe.shape != (1, DIMS):
+                raise RuntimeError(
+                    f"embedding llama-server returned shape {probe.shape}; "
+                    f"expected (1, {DIMS})"
+                )
+        except BaseException:
+            stop_server(process)
+            raise
+        self.process = process
+        atexit.register(self.close)
 
     def embed_query(self, query: str) -> bytes:
         from corpus_store.embed import PREFIX_QUERY, embed_batch, pack_binary
 
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("embedding llama-server is closed")
         vector = embed_batch([PREFIX_QUERY + query], self.port)[0]
         return pack_binary(vector)
 
     def close(self) -> None:
-        self.process.terminate()
-        self.process.wait()
+        from corpus_store.embed import stop_server
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            atexit.unregister(self.close)
+            stop_server(self.process)
 
     def __enter__(self) -> "LlamaQueryEmbedder":
         return self

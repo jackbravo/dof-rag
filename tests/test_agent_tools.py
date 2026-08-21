@@ -1161,6 +1161,27 @@ class AgentToolsTests(unittest.TestCase):
         self.assertEqual(turn.output_items[0]["reasoning_content"], "reasoning")
         self.assertEqual(client.kwargs["messages"][-1]["role"], "tool")
         self.assertEqual(client.kwargs["tools"][0]["function"]["name"], "read_chunks")
+        self.assertNotIn("reasoning_effort", client.kwargs)
         backend.create_turn(input_items=[], tools=[], instructions="final")
         self.assertEqual(client.kwargs["tool_choice"], "none")
         self.assertNotIn("tools", client.kwargs)
+
+    def test_chat_adapter_sends_configured_reasoning_effort(self):
+        message = DumpableItem(role="assistant", content="answer", tool_calls=[])
+        response = SimpleNamespace(
+            id="chat-1",
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+        )
+        client = ChatCompletionsClient(response)
+        backend = OpenAIChatCompletionsBackend(
+            model="qwen3.8",
+            api_key="test",
+            base_url="http://127.0.0.1:8080/v1",
+            reasoning_effort="low",
+            client=client,
+        )
+
+        backend.create_turn(input_items=[], tools=[], instructions="test")
+
+        self.assertEqual(client.kwargs["reasoning_effort"], "low")

@@ -944,6 +944,7 @@ class OpenAIChatCompletionsBackend:
         model: str,
         api_key: str,
         base_url: str,
+        reasoning_effort: str | None = None,
         max_output_tokens: int = 2400,
         client: Any = None,
     ):
@@ -953,6 +954,7 @@ class OpenAIChatCompletionsBackend:
             client = OpenAI(api_key=api_key, base_url=base_url)
         self.client = client
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.max_output_tokens = max_output_tokens
 
     @staticmethod
@@ -1015,6 +1017,8 @@ class OpenAIChatCompletionsBackend:
             "parallel_tool_calls": False,
             "max_tokens": self.max_output_tokens,
         }
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = self._chat_tools(tools)
             kwargs["tool_choice"] = "auto"

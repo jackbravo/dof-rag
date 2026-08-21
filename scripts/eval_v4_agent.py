@@ -225,6 +225,7 @@ def main() -> int:
             model=args.model,
             api_key=os.environ.get("DOF_AGENT_API_KEY", "llama-server"),
             base_url=args.base_url or "http://127.0.0.1:8080/v1",
+            reasoning_effort=args.reasoning_effort or None,
         )
     elif args.provider == "kimi-code":
         api_key = os.environ.get("KIMI_API_KEY", "")

@@ -10,6 +10,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from agent_tools.agent import (
     AgentRunner,
@@ -25,6 +26,21 @@ from .service import ProgressCallback, PublicExecutionError
 DEFAULT_GGUF_MODEL = "~/dof-gguf/jina-v5-small-retrieval-F16.gguf"
 DEFAULT_VEC0_DB = "dof_db/dof_vec0_jina_binary.sqlite"
 RETRIEVAL_MODES = frozenset({"lexical", "vector", "hybrid"})
+LOCAL_AGENT_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _endpoint_port(url: str) -> tuple[str | None, int | None]:
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid DOF_AGENT_BASE_URL: {exc}") from exc
+    if port is None:
+        if parsed.scheme == "https":
+            port = 443
+        elif parsed.scheme == "http":
+            port = 80
+    return parsed.hostname, port
 
 
 @dataclass(frozen=True)
@@ -81,6 +97,19 @@ class AgentExecutorConfig:
                     f"DOF_RETRIEVAL_MODE={retrieval_mode} requires an existing "
                     "GGUF embedding model (DOF_GGUF_MODEL)"
                 )
+        embed_port = int(os.environ.get("DOF_EMBED_PORT", "8086"))
+        if not 1 <= embed_port <= 65535:
+            raise ValueError("DOF_EMBED_PORT must be between 1 and 65535")
+        base_url = os.environ.get("DOF_AGENT_BASE_URL")
+        if provider == "llama-server" and retrieval_mode != "lexical":
+            host, agent_port = _endpoint_port(
+                base_url or "http://127.0.0.1:8080/v1"
+            )
+            if host in LOCAL_AGENT_HOSTS and agent_port == embed_port:
+                raise ValueError(
+                    "DOF_AGENT_BASE_URL and DOF_EMBED_PORT must use different "
+                    "local ports"
+                )
         return cls(
             repo_root=root,
             provider=provider,
@@ -93,12 +122,12 @@ class AgentExecutorConfig:
             ),
             vec0_db=vec0_db,
             gguf_model=gguf_model,
-            embed_port=int(os.environ.get("DOF_EMBED_PORT", "8086")),
+            embed_port=embed_port,
             reasoning_effort=os.environ.get("DOF_REASONING_EFFORT", "low") or None,
             max_model_turns=int(os.environ.get("DOF_MAX_MODEL_TURNS", "8")),
             max_tool_calls=int(os.environ.get("DOF_MAX_TOOL_CALLS", "8")),
             retrieval_mode=retrieval_mode,
-            base_url=os.environ.get("DOF_AGENT_BASE_URL"),
+            base_url=base_url,
         )
 
 
@@ -233,6 +262,7 @@ class AgentRunExecutor:
                 model=self.config.model,
                 api_key=os.environ.get("DOF_AGENT_API_KEY", "llama-server"),
                 base_url=self.config.base_url or "http://127.0.0.1:8080/v1",
+                reasoning_effort=self.config.reasoning_effort,
             )
         if self.config.provider == "kimi-code":
             api_key = os.environ.get("KIMI_API_KEY", "")
@@ -285,16 +315,21 @@ class AgentRunExecutor:
             raise
         except Exception as exc:
             name = type(exc).__name__
+            status_code = getattr(exc, "status_code", None)
             if name in {
                 "APIConnectionError",
                 "APITimeoutError",
+                "APIStatusError",
                 "AuthenticationError",
+                "BadRequestError",
+                "InternalServerError",
+                "NotFoundError",
                 "PermissionDeniedError",
                 "RateLimitError",
             }:
                 code = (
                     "rate_limited"
-                    if name == "RateLimitError"
+                    if name == "RateLimitError" or status_code == 429
                     else "provider_unavailable"
                 )
                 raise PublicExecutionError(
