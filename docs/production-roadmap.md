@@ -101,6 +101,21 @@ cuando el servidor lo soporte de forma estable, MTP o un modelo de borrador.
 Qwen3.8-27B es el primer candidato, no una obligación. Usaremos la misma muestra
 para comparar cuantizaciones, otros modelos y equipos Apple o NVIDIA.
 
+MTP merece una prueba distinta por plataforma. Qwen3.8 ya incluye la cabeza de
+predicción y `llama-server` puede activarla sin descargar otro modelo. Los
+resultados publicados hasta ahora son buenos en varias tarjetas NVIDIA, pero no
+se trasladan directamente a Metal: en Apple Silicon la verificación de lotes
+pequeños puede comerse el ahorro, sobre todo en prosa.
+
+En nuestro M3 Pro, SP-002 con `draft-mtp` y dos tokens de borrador conservó la
+cita correcta. La generación subió de unos 7.5 a entre 8.3 y 8.7 tokens por
+segundo, pero la corrida completa tardó 356 segundos, contra 259 sin MTP. El
+modelo también generó más razonamiento y procesó más contexto, así que no es una
+comparación controlada suficiente para atribuir toda la diferencia a MTP. Por
+ahora no será el valor predeterminado en Mac. Lo volveremos a medir con una
+muestra fija, varias repeticiones y un `llama.cpp` reciente; en NVIDIA tendrá su
+propio barrido de profundidad y memoria.
+
 ### 3. Poner admisión delante del modelo
 
 Con 403 segundos por una pregunta, un solo slot atendería como máximo unas nueve
