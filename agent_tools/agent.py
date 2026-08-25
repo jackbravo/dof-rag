@@ -396,6 +396,19 @@ def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_nullable_literals(
+    schema: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Tolerate local models that serialize JSON null as the string ``null``."""
+    normalized = dict(arguments)
+    properties = schema.get("properties", {})
+    for name, value in arguments.items():
+        expected = properties.get(name, {}).get("type")
+        if value == "null" and isinstance(expected, list) and "null" in expected:
+            normalized[name] = None
+    return normalized
+
+
 def _query_snippet(text: str, query: str, max_chars: int) -> tuple[str, bool]:
     if len(text) <= max_chars:
         return text, False
@@ -732,6 +745,7 @@ class DofToolbox:
                     "message": "arguments are not valid JSON",
                 },
             }
+        arguments = _normalize_nullable_literals(self._schemas[name], arguments)
         errors = sorted(
             Draft202012Validator(self._schemas[name]).iter_errors(arguments),
             key=lambda error: list(error.path),

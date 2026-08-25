@@ -304,6 +304,45 @@ class AgentToolsTests(unittest.TestCase):
         self.assertTrue(output["ok"])
         self.assertTrue(retriever.calls[0][1]["prefer_recent"])
 
+    def test_toolbox_normalizes_string_null_for_nullable_arguments(self):
+        class RecordingRetriever(FakeRetriever):
+            def __init__(self):
+                self.calls = []
+
+            def search_documents(self, query, **kwargs):
+                self.calls.append((query, kwargs))
+                return DocumentSearchResult(
+                    query=query,
+                    strategy=RetrievalStrategy(kwargs["strategy"]),
+                    filters=kwargs["filters"],
+                    versions=self.versions,
+                )
+
+        retriever = RecordingRetriever()
+        toolbox = DofToolbox(retriever)
+        toolbox.begin(as_of=None)
+        output = toolbox.call(
+            "search_documents",
+            {
+                "query": "tipo de cambio",
+                "strategy": "lexical",
+                "as_of": "null",
+                "date_from": "null",
+                "date_to": "null",
+                "section": "null",
+                "prefer_recent": "null",
+                "top_k": 5,
+            },
+        )
+
+        self.assertTrue(output["ok"])
+        filters = retriever.calls[0][1]["filters"]
+        self.assertEqual(
+            filters.to_dict(),
+            {"as_of": None, "date_from": None, "date_to": None, "section": None},
+        )
+        self.assertFalse(retriever.calls[0][1]["prefer_recent"])
+
     def test_recency_rerank_gives_recent_chunks_visibility_without_dominance(self):
         ranked = [10, 11, 12, 13, 14]
         dates = {

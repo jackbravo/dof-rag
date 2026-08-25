@@ -334,6 +334,12 @@ class AgentExecutorConfigTests(unittest.TestCase):
             backend = executor._backend()
         self.assertEqual(str(backend.client.base_url), "http://127.0.0.1:9999/v1/")
 
+    def test_empty_reasoning_effort_disables_the_optional_field(self):
+        config = self._config(
+            DOF_AGENT_PROVIDER="llama-server", DOF_REASONING_EFFORT=""
+        )
+        self.assertIsNone(config.reasoning_effort)
+
     def test_non_lexical_mode_requires_existing_vector_index(self):
         with self.assertRaisesRegex(ValueError, "vector index"):
             self._config(DOF_RETRIEVAL_MODE="hybrid")
@@ -809,6 +815,36 @@ class ServiceTests(unittest.TestCase):
                 )
         finally:
             service.close()
+
+    def test_worker_logs_the_private_cause_of_a_public_failure(self):
+        class FailingExecutor(FakeExecutor):
+            def execute(self, request, *, on_progress=None):
+                try:
+                    raise RuntimeError("private provider detail")
+                except RuntimeError as exc:
+                    raise PublicExecutionError(
+                        "provider_unavailable", "El proveedor no está disponible."
+                    ) from exc
+
+        executor = FailingExecutor()
+        service = EvaluationService(self.store, executor, executor.provenance)
+        with mock.patch("human_eval.service.LOGGER.exception") as log_exception:
+            service.start()
+            try:
+                created = service.submit(
+                    RunRequest("pregunta válida"), user_id="evaluator", admin=True
+                )
+                finished = wait_for_terminal(service, created["run_id"])
+            finally:
+                service.close()
+
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(finished["error"]["code"], "provider_unavailable")
+        log_exception.assert_called_once_with(
+            "human-evaluation run %s failed with %s",
+            created["run_id"],
+            "provider_unavailable",
+        )
 
     def test_submit_prepares_executor_before_snapshotting_provenance(self):
         class PreparingExecutor(FakeExecutor):

@@ -170,10 +170,10 @@ export DOF_AGENT_PROVIDER=kimi-code DOF_AGENT_MODEL=kimi-for-coding \
 uv run python -m human_eval.app  # http://127.0.0.1:8765
 ```
 
-También se puede usar un modelo local a través de cualquier servidor
-OpenAI-compatible (llama.cpp `llama-server`, LM Studio, vLLM, ...). Para
-Qwen3.8-27B en esta Mac, inicia un solo slot con 32K de contexto y conserva el
-razonamiento entre turnos de herramientas:
+También se puede usar un modelo local mediante un servidor compatible con la
+API de OpenAI. La configuración probada en Apple Silicon usa Qwen3.8-27B con
+llama.cpp `llama-server`: un solo slot, 32K de contexto y razonamiento
+conservado entre turnos de herramientas.
 
 ```bash
 llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
@@ -187,6 +187,8 @@ bucle de hasta ocho turnos; se puede cambiar con `DOF_REASONING_EFFORT` a
 razonamiento bajo de [Simon Willison](https://simonwillison.net/2026/Aug/16/qwen-38-27b/)
 y el soporte nativo descrito en la
 [ficha oficial de Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
+Otros servidores compatibles pueden ignorar o rechazar ese parámetro; configura
+`DOF_REASONING_EFFORT=` para omitirlo.
 
 Con el servidor escuchando en `http://127.0.0.1:8080/` (verifica el id con
 `curl -s localhost:8080/v1/models`):

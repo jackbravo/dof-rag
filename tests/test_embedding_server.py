@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -69,6 +70,61 @@ class EmbeddingServerTests(unittest.TestCase):
         embed_batch.assert_called_once_with(["Query: probe"], 8086)
         register.assert_called_once()
         unregister.assert_called_once()
+        stop.assert_called_once_with(process)
+
+    def test_close_waits_for_an_in_flight_embedding(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        query_started = threading.Event()
+        release_query = threading.Event()
+        close_started = threading.Event()
+        errors: list[BaseException] = []
+
+        def embed_batch(texts, port):
+            if texts == ["Query: probe"]:
+                return np.zeros((1, DIMS), dtype=np.float32)
+            query_started.set()
+            if not release_query.wait(timeout=1):
+                raise TimeoutError("test did not release the embedding request")
+            return np.zeros((1, DIMS), dtype=np.float32)
+
+        with (
+            mock.patch("corpus_store.embed.start_server", return_value=process),
+            mock.patch("corpus_store.embed.embed_batch", side_effect=embed_batch),
+            mock.patch("corpus_store.embed.stop_server") as stop,
+            mock.patch("agent_tools.retrieval.atexit.register"),
+            mock.patch("agent_tools.retrieval.atexit.unregister"),
+        ):
+            embedder = LlamaQueryEmbedder(Path("model.gguf"))
+
+            def run_query():
+                try:
+                    embedder.embed_query("consulta")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def run_close():
+                close_started.set()
+                embedder.close()
+
+            query_thread = threading.Thread(target=run_query)
+            close_thread = threading.Thread(target=run_close)
+            query_thread.start()
+            self.assertTrue(query_started.wait(timeout=1))
+            close_thread.start()
+            self.assertTrue(close_started.wait(timeout=1))
+            close_thread.join(timeout=0.05)
+
+            self.assertTrue(close_thread.is_alive())
+            stop.assert_not_called()
+
+            release_query.set()
+            query_thread.join(timeout=1)
+            close_thread.join(timeout=1)
+
+        self.assertFalse(query_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(errors, [])
         stop.assert_called_once_with(process)
 
 

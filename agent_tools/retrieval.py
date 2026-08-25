@@ -239,7 +239,7 @@ class LlamaQueryEmbedder:
         with self._lock:
             if self._closed:
                 raise RuntimeError("embedding llama-server is closed")
-        vector = embed_batch([PREFIX_QUERY + query], self.port)[0]
+            vector = embed_batch([PREFIX_QUERY + query], self.port)[0]
         return pack_binary(vector)
 
     def close(self) -> None:
