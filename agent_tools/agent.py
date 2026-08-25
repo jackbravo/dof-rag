@@ -321,6 +321,8 @@ class ToolTrace:
     arguments: dict[str, Any] | None
     output: dict[str, Any]
     elapsed_ms: float
+    full_output_bytes: int = 0
+    model_output_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1357,6 +1359,18 @@ class AgentRunner:
                         tool_started = perf_counter()
                         output = self.toolbox.call(call.name, call.arguments)
                         elapsed_ms = (perf_counter() - tool_started) * 1000.0
+                    model_output = _model_tool_output(call.name, output)
+                    model_output_text = json.dumps(
+                        model_output,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if call.name in available_names and len(traces) < self.max_tool_calls:
+                        full_output_bytes = len(
+                            json.dumps(
+                                output, ensure_ascii=False, separators=(",", ":")
+                            ).encode("utf-8")
+                        )
                         traces.append(
                             ToolTrace(
                                 sequence=len(traces) + 1,
@@ -1366,6 +1380,8 @@ class AgentRunner:
                                 arguments=call.arguments,
                                 output=output,
                                 elapsed_ms=elapsed_ms,
+                                full_output_bytes=full_output_bytes,
+                                model_output_bytes=len(model_output_text.encode("utf-8")),
                             )
                         )
                     _emit_progress(
@@ -1383,7 +1399,7 @@ class AgentRunner:
                         {
                             "type": "function_call_output",
                             "call_id": call.call_id,
-                            "output": json.dumps(output, ensure_ascii=False),
+                            "output": model_output_text,
                         }
                     )
                 continue
@@ -1640,6 +1656,121 @@ def _tool_reason(name: str) -> str:
         "get_document_outline": "La estructura ayuda a ubicar las secciones que conviene leer.",
         "read_chunks": "Sólo los chunks leídos pueden convertirse en evidencia y citas de la respuesta.",
     }.get(name, "Esta consulta aporta evidencia observable para el siguiente paso.")
+
+
+MODEL_EVIDENCE_SNIPPET_CHARS = 360
+
+
+def _present_fields(item: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        name: item[name]
+        for name in names
+        if name in item and item[name] not in (None, [], "")
+    }
+
+
+def _model_tool_output(name: str, output: dict[str, Any]) -> dict[str, Any]:
+    """Return the smallest tool result the model needs for its next decision."""
+    if not output.get("ok"):
+        error = output.get("error", {})
+        return {
+            "ok": False,
+            "error": {
+                "type": error.get("type", "tool_error"),
+                "message": error.get("message", "La consulta falló."),
+            },
+        }
+
+    data = output.get("data", {})
+    compact: dict[str, Any] = {"ok": True}
+    if name in {"list_publications", "search_documents"}:
+        source_key = "publications" if name == "list_publications" else "documents"
+        items = data.get(source_key, [])
+        compact[source_key] = [
+            _present_fields(
+                item,
+                (
+                    "document_id",
+                    "publication_date",
+                    "section",
+                    "title",
+                    "institution",
+                    "rank",
+                ),
+            )
+            for item in items
+        ]
+        return compact
+
+    if name == "search_evidence":
+        query = str(data.get("query") or "")
+        evidence = []
+        for item in data.get("evidence", []):
+            snippet, narrowed = _query_snippet(
+                str(item.get("snippet") or ""),
+                query,
+                MODEL_EVIDENCE_SNIPPET_CHARS,
+            )
+            candidate = _present_fields(
+                item,
+                (
+                    "chunk_id",
+                    "document_id",
+                    "heading_path",
+                    "rank",
+                ),
+            )
+            candidate["snippet"] = snippet
+            if item.get("snippet_truncated") or narrowed:
+                candidate["snippet_truncated"] = True
+            evidence.append(candidate)
+        compact["evidence"] = evidence
+        return compact
+
+    if name == "get_document_outline":
+        compact.update(
+            _present_fields(
+                data,
+                (
+                    "document_id",
+                    "publication_date",
+                    "section",
+                    "title",
+                    "institution",
+                    "outline_truncated",
+                ),
+            )
+        )
+        compact["chunks"] = [
+            _present_fields(
+                item,
+                ("chunk_id", "chunk_index", "heading_path", "token_count"),
+            )
+            for item in data.get("chunks", [])
+        ]
+        return compact
+
+    if name == "read_chunks":
+        compact["chunks"] = [
+            _present_fields(
+                item,
+                (
+                    "chunk_id",
+                    "document_id",
+                    "publication_date",
+                    "section",
+                    "heading_path",
+                    "title",
+                    "text",
+                ),
+            )
+            for item in data.get("chunks", [])
+        ]
+        if "coverage" in data:
+            compact["coverage"] = data["coverage"]
+        return compact
+
+    return output
 
 
 def _public_tool_progress(

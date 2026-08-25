@@ -73,6 +73,15 @@ El primer paquete de cambios será:
 Cada reducción debe pasar eval-v4. No aceptaremos una mejora de latencia que
 empeore cobertura, uso de herramientas o precisión de citas.
 
+**Avance del 25 de agosto de 2026.** El agente ya separa el resultado completo,
+que permanece en la traza, de la versión compacta que recibe el modelo. En una
+repetición de SP-002 con la misma configuración, los tokens totales bajaron de
+24,410 a 12,590 y el tiempo de 403 a 259 segundos; ambos intentos terminaron con
+la cita correcta al chunk `1342011`. En la corrida nueva, los tres resultados de
+herramientas ocuparon 16,825 bytes completos y 8,659 bytes frente al modelo.
+Es una medición de una sola pregunta y Qwen puede variar entre corridas, así que
+la tomamos como señal prometedora, no como cifra definitiva de capacidad.
+
 ### 2. Construir una línea base que podamos repetir
 
 La siguiente medición debe incluir preguntas fáciles, multi-documento, de fecha
@@ -172,11 +181,11 @@ inferencia. Eso permite cambiar una pieza sin rehacer el proyecto.
 
 ## Próximos tres entregables
 
-1. Un reporte reproducible con 10 a 20 preguntas y métricas por turno.
-2. Resultados de herramientas compactos, con comparación antes/después en
-   tokens, latencia y calidad.
-3. Admisión con capacidad global, cola visible, `Retry-After` y métricas de
+1. Ampliar la comparación de resultados compactos a 10 o 20 preguntas, con
+   métricas por turno y revisión de calidad.
+2. Admisión con capacidad global, cola visible, `Retry-After` y métricas de
    espera.
+3. Una línea base de uno y dos slots para fijar la concurrencia inicial.
 
 Después de esos tres trabajos podremos fijar una concurrencia inicial y abrir
 una beta pequeña con datos, no con estimaciones.
