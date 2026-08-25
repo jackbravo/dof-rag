@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -42,9 +43,9 @@ from pathlib import Path
 
 import numpy as np
 
-from rag_poc.chunker import DocPattern
 from corpus_store.chunk_index import normalized_text, reconstruct
 from corpus_store.db import connect, fetch_document_text
+from rag_poc.chunker import DocPattern
 
 MODEL_ID = "jinaai/jina-embeddings-v5-text-small"
 PREFIX_DOCUMENT = "Document: "
@@ -63,23 +64,77 @@ CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT NOT NUL
 INSERT_EVERY = 2048  # vectors per committed batch
 
 
-def start_server(gguf: Path, ctx: int, port: int) -> subprocess.Popen:
-    proc = subprocess.Popen(
-        [
-            "llama-server", "-m", str(gguf),
-            "--embedding", "--port", str(port),
-            "-c", str(ctx), "-b", "8192", "-ub", "4096",
-            "--log-disable",
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    for _ in range(180):
+def _assert_port_available(port: int) -> None:
+    if not 1 <= port <= 65535:
+        raise ValueError("llama-server port must be between 1 and 65535")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
-            return proc
-        except Exception:
+            probe.bind(("127.0.0.1", port))
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot start embedding llama-server: port {port} is already in use"
+            ) from exc
+
+
+def stop_server(proc: subprocess.Popen, *, timeout: float = 10.0) -> None:
+    """Terminate and reap an owned llama-server, escalating if it will not exit."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def start_server(gguf: Path, ctx: int, port: int) -> subprocess.Popen:
+    _assert_port_available(port)
+    proc: subprocess.Popen | None = None
+    try:
+        proc = subprocess.Popen(
+            [
+                "llama-server",
+                "-m",
+                str(gguf),
+                "--embedding",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "-c",
+                str(ctx),
+                "-b",
+                "8192",
+                "-ub",
+                "4096",
+                "--log-disable",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(180):
+            exit_code = proc.poll()
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"embedding llama-server exited during startup with code {exit_code}"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=1
+                ) as response:
+                    if response.status == 200:
+                        return proc
+            except OSError:
+                pass
             time.sleep(1)
-    raise RuntimeError("llama-server did not become healthy")
+        raise RuntimeError("embedding llama-server did not become healthy")
+    except BaseException:
+        if proc is not None:
+            stop_server(proc)
+        raise
 
 
 def embed_batch(texts: list[str], port: int, retries: int = 6) -> np.ndarray:
@@ -111,6 +166,8 @@ def embed_batch(texts: list[str], port: int, retries: int = 6) -> np.ndarray:
 
 def pack_binary(emb: np.ndarray) -> bytes:
     """sign() quantization: (emb >= 0) packed to DIMS/8 bytes."""
+    if emb.shape != (DIMS,):
+        raise ValueError(f"embedding shape {emb.shape} does not match ({DIMS},)")
     return np.packbits(emb >= 0).tobytes()
 
 
@@ -230,8 +287,7 @@ def main() -> None:
               f"db size {size / 2**20:.1f} MiB "
               f"({size / max(n_done + last_id, 1):.0f} B/vec incl. overhead)")
     finally:
-        proc.terminate()
-        proc.wait()
+        stop_server(proc)
     vectors.close()
 
 

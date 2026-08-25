@@ -304,6 +304,45 @@ class AgentToolsTests(unittest.TestCase):
         self.assertTrue(output["ok"])
         self.assertTrue(retriever.calls[0][1]["prefer_recent"])
 
+    def test_toolbox_normalizes_string_null_for_nullable_arguments(self):
+        class RecordingRetriever(FakeRetriever):
+            def __init__(self):
+                self.calls = []
+
+            def search_documents(self, query, **kwargs):
+                self.calls.append((query, kwargs))
+                return DocumentSearchResult(
+                    query=query,
+                    strategy=RetrievalStrategy(kwargs["strategy"]),
+                    filters=kwargs["filters"],
+                    versions=self.versions,
+                )
+
+        retriever = RecordingRetriever()
+        toolbox = DofToolbox(retriever)
+        toolbox.begin(as_of=None)
+        output = toolbox.call(
+            "search_documents",
+            {
+                "query": "tipo de cambio",
+                "strategy": "lexical",
+                "as_of": "null",
+                "date_from": "null",
+                "date_to": "null",
+                "section": "null",
+                "prefer_recent": "null",
+                "top_k": 5,
+            },
+        )
+
+        self.assertTrue(output["ok"])
+        filters = retriever.calls[0][1]["filters"]
+        self.assertEqual(
+            filters.to_dict(),
+            {"as_of": None, "date_from": None, "date_to": None, "section": None},
+        )
+        self.assertFalse(retriever.calls[0][1]["prefer_recent"])
+
     def test_recency_rerank_gives_recent_chunks_visibility_without_dominance(self):
         ranked = [10, 11, 12, 13, 14]
         dates = {
@@ -1161,6 +1200,27 @@ class AgentToolsTests(unittest.TestCase):
         self.assertEqual(turn.output_items[0]["reasoning_content"], "reasoning")
         self.assertEqual(client.kwargs["messages"][-1]["role"], "tool")
         self.assertEqual(client.kwargs["tools"][0]["function"]["name"], "read_chunks")
+        self.assertNotIn("reasoning_effort", client.kwargs)
         backend.create_turn(input_items=[], tools=[], instructions="final")
         self.assertEqual(client.kwargs["tool_choice"], "none")
         self.assertNotIn("tools", client.kwargs)
+
+    def test_chat_adapter_sends_configured_reasoning_effort(self):
+        message = DumpableItem(role="assistant", content="answer", tool_calls=[])
+        response = SimpleNamespace(
+            id="chat-1",
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+        )
+        client = ChatCompletionsClient(response)
+        backend = OpenAIChatCompletionsBackend(
+            model="qwen3.8",
+            api_key="test",
+            base_url="http://127.0.0.1:8080/v1",
+            reasoning_effort="low",
+            client=client,
+        )
+
+        backend.create_turn(input_items=[], tools=[], instructions="test")
+
+        self.assertEqual(client.kwargs["reasoning_effort"], "low")

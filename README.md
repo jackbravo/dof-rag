@@ -154,18 +154,58 @@ El corpus completo ya está construido: 657,867 documentos, 6.73 millones de chu
   ```
 
   Reporte en `reports/eval_v4_retrieval.md` y resultados deterministas versionados en `eval/cache/eval_v4_full_comparison.json`. Resultado final: la fusión híbrida supera a BM25 puro (MRR 0.339 contra 0.221; all-hop@20 0.595 contra 0.429).
-- Evaluación del agente completo: `uv run python scripts/eval_v4_agent.py --provider kimi-code --model kimi-for-coding`.
+- Evaluación del agente completo: `uv run python scripts/eval_v4_agent.py --provider kimi-code --model kimi-for-coding` (también `--provider llama-server --model <id>` contra un servidor local OpenAI-compatible, por defecto `http://127.0.0.1:8080/v1`).
 
 ## Sitio de evaluación humana
 
 Aplicación web (Air + Clerk) en `human_eval/` para que personas formulen preguntas reales al agente y evalúen las respuestas.
 
+El modo de recuperación por defecto es `lexical`. Para usar el índice vec0 y
+embeddings GGUF, configura `DOF_RETRIEVAL_MODE=hybrid`.
+
 ```bash
 set -a; source .env; set +a  # CLERK_* y DOF_SESSION_SECRET (nunca imprimir valores)
 export DOF_AGENT_PROVIDER=kimi-code DOF_AGENT_MODEL=kimi-for-coding \
-  DOF_RETRIEVAL_MODE=lexical DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
+  DOF_RETRIEVAL_MODE=hybrid DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
 uv run python -m human_eval.app  # http://127.0.0.1:8765
 ```
+
+También se puede usar un modelo local mediante un servidor compatible con la
+API de OpenAI. La configuración probada en Apple Silicon usa Qwen3.8-27B con
+llama.cpp `llama-server`: un solo slot, 32K de contexto y razonamiento
+conservado entre turnos de herramientas.
+
+```bash
+llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
+  --jinja --alias qwen3.8 --reasoning-preserve -c 32768 -np 1
+```
+
+Qwen3.8 usa razonamiento `xhigh` por defecto. El agente envía
+`reasoning_effort=low` en cada petición para evitar sobre-razonamiento en el
+bucle de hasta ocho turnos; se puede cambiar con `DOF_REASONING_EFFORT` a
+`medium` o `xhigh`. Esta elección sigue la recomendación de empezar con
+razonamiento bajo de [Simon Willison](https://simonwillison.net/2026/Aug/16/qwen-38-27b/)
+y el soporte nativo descrito en la
+[ficha oficial de Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
+Otros servidores compatibles pueden ignorar o rechazar ese parámetro; configura
+`DOF_REASONING_EFFORT=` para omitirlo.
+
+Con el servidor escuchando en `http://127.0.0.1:8080/` (verifica el id con
+`curl -s localhost:8080/v1/models`):
+
+```bash
+set -a; source .env; set +a
+export DOF_AGENT_PROVIDER=llama-server DOF_AGENT_MODEL=qwen3.8 \
+  DOF_REASONING_EFFORT=low DOF_RETRIEVAL_MODE=hybrid \
+  DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
+uv run python -m human_eval.app
+```
+
+- `DOF_AGENT_PROVIDER=llama-server` usa el endpoint de Chat Completions de `DOF_AGENT_BASE_URL` (por defecto `http://127.0.0.1:8080/v1`). No requiere API key; si la sirves con autenticación, pásala por `DOF_AGENT_API_KEY`.
+- El modelo de chat local usa el puerto 8080 y el servidor de embeddings del
+  modo `hybrid` usa `DOF_EMBED_PORT` (8086 por defecto). Pueden correr a la vez,
+  pero la aplicación rechaza configuraciones donde ambos intenten usar el mismo
+  puerto local.
 
 - Visitantes anónimos leen las respuestas publicadas. Con cuenta: 1 pregunta cada 24 h (`DOF_DAILY_QUESTION_LIMIT`) y hay que evaluar una respuesta publicada antes de cada pregunta, incluida la primera. Los administradores publican y despublican en `/admin/queue` (rol vía `public_metadata.role = "admin"` en el dashboard de Clerk).
 - Recuperación híbrida para preguntas en vivo: `DOF_RETRIEVAL_MODE=hybrid` (requiere el índice vec0 y `DOF_GGUF_MODEL`; el servidor de embeddings llama-server se levanta una sola vez por proceso, con `DOF_EMBED_PORT`, por defecto 8086).

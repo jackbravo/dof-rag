@@ -396,6 +396,19 @@ def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_nullable_literals(
+    schema: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Tolerate local models that serialize JSON null as the string ``null``."""
+    normalized = dict(arguments)
+    properties = schema.get("properties", {})
+    for name, value in arguments.items():
+        expected = properties.get(name, {}).get("type")
+        if value == "null" and isinstance(expected, list) and "null" in expected:
+            normalized[name] = None
+    return normalized
+
+
 def _query_snippet(text: str, query: str, max_chars: int) -> tuple[str, bool]:
     if len(text) <= max_chars:
         return text, False
@@ -732,6 +745,7 @@ class DofToolbox:
                     "message": "arguments are not valid JSON",
                 },
             }
+        arguments = _normalize_nullable_literals(self._schemas[name], arguments)
         errors = sorted(
             Draft202012Validator(self._schemas[name]).iter_errors(arguments),
             key=lambda error: list(error.path),
@@ -944,6 +958,7 @@ class OpenAIChatCompletionsBackend:
         model: str,
         api_key: str,
         base_url: str,
+        reasoning_effort: str | None = None,
         max_output_tokens: int = 2400,
         client: Any = None,
     ):
@@ -953,6 +968,7 @@ class OpenAIChatCompletionsBackend:
             client = OpenAI(api_key=api_key, base_url=base_url)
         self.client = client
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.max_output_tokens = max_output_tokens
 
     @staticmethod
@@ -1015,6 +1031,8 @@ class OpenAIChatCompletionsBackend:
             "parallel_tool_calls": False,
             "max_tokens": self.max_output_tokens,
         }
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = self._chat_tools(tools)
             kwargs["tool_choice"] = "auto"

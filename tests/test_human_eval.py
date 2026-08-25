@@ -293,6 +293,53 @@ class AgentExecutorConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._config(DOF_RETRIEVAL_MODE="weird")
 
+    def test_accepts_llama_server_provider(self):
+        config = self._config(DOF_AGENT_PROVIDER="llama-server")
+        self.assertEqual(config.provider, "llama-server")
+
+    def test_rejects_unknown_provider(self):
+        with self.assertRaisesRegex(ValueError, "DOF_AGENT_PROVIDER"):
+            self._config(DOF_AGENT_PROVIDER="weird")
+
+    def test_llama_server_backend_uses_local_openai_compatible_endpoint(self):
+        executor = AgentRunExecutor(
+            AgentExecutorConfig(
+                repo_root=self.root,
+                provider="llama-server",
+                model="ornith",
+                corpus_db=self.root / "missing-corpus.sqlite",
+                chunks_db=self.root / "missing-chunks.sqlite",
+            )
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            backend = executor._backend()
+        self.assertEqual(backend.model, "ornith")
+        self.assertEqual(
+            str(backend.client.base_url), "http://127.0.0.1:8080/v1/"
+        )
+        self.assertEqual(backend.reasoning_effort, "low")
+
+    def test_llama_server_backend_honors_base_url_override(self):
+        executor = AgentRunExecutor(
+            AgentExecutorConfig(
+                repo_root=self.root,
+                provider="llama-server",
+                model="ornith",
+                corpus_db=self.root / "missing-corpus.sqlite",
+                chunks_db=self.root / "missing-chunks.sqlite",
+                base_url="http://127.0.0.1:9999/v1/",
+            )
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            backend = executor._backend()
+        self.assertEqual(str(backend.client.base_url), "http://127.0.0.1:9999/v1/")
+
+    def test_empty_reasoning_effort_disables_the_optional_field(self):
+        config = self._config(
+            DOF_AGENT_PROVIDER="llama-server", DOF_REASONING_EFFORT=""
+        )
+        self.assertIsNone(config.reasoning_effort)
+
     def test_non_lexical_mode_requires_existing_vector_index(self):
         with self.assertRaisesRegex(ValueError, "vector index"):
             self._config(DOF_RETRIEVAL_MODE="hybrid")
@@ -322,6 +369,25 @@ class AgentExecutorConfigTests(unittest.TestCase):
         self.assertEqual(config.vec0_db, vec0)
         self.assertEqual(config.gguf_model, gguf)
         self.assertEqual(config.embed_port, 9999)
+
+    def test_rejects_invalid_embedding_port(self):
+        with self.assertRaisesRegex(ValueError, "DOF_EMBED_PORT"):
+            self._config(DOF_EMBED_PORT="0")
+
+    def test_rejects_shared_local_chat_and_embedding_port(self):
+        vec0_dir = self.root.resolve() / "dof_db"
+        vec0_dir.mkdir()
+        (vec0_dir / "dof_vec0_jina_binary.sqlite").touch()
+        gguf = self.root / "model.gguf"
+        gguf.touch()
+        with self.assertRaisesRegex(ValueError, "different local ports"):
+            self._config(
+                DOF_AGENT_PROVIDER="llama-server",
+                DOF_RETRIEVAL_MODE="hybrid",
+                DOF_GGUF_MODEL=str(gguf),
+                DOF_AGENT_BASE_URL="http://127.0.0.1:8080/v1",
+                DOF_EMBED_PORT="8080",
+            )
 
 
 class AgentExecutorEmbedderTests(unittest.TestCase):
@@ -749,6 +815,36 @@ class ServiceTests(unittest.TestCase):
                 )
         finally:
             service.close()
+
+    def test_worker_logs_the_private_cause_of_a_public_failure(self):
+        class FailingExecutor(FakeExecutor):
+            def execute(self, request, *, on_progress=None):
+                try:
+                    raise RuntimeError("private provider detail")
+                except RuntimeError as exc:
+                    raise PublicExecutionError(
+                        "provider_unavailable", "El proveedor no está disponible."
+                    ) from exc
+
+        executor = FailingExecutor()
+        service = EvaluationService(self.store, executor, executor.provenance)
+        with mock.patch("human_eval.service.LOGGER.exception") as log_exception:
+            service.start()
+            try:
+                created = service.submit(
+                    RunRequest("pregunta válida"), user_id="evaluator", admin=True
+                )
+                finished = wait_for_terminal(service, created["run_id"])
+            finally:
+                service.close()
+
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(finished["error"]["code"], "provider_unavailable")
+        log_exception.assert_called_once_with(
+            "human-evaluation run %s failed with %s",
+            created["run_id"],
+            "provider_unavailable",
+        )
 
     def test_submit_prepares_executor_before_snapshotting_provenance(self):
         class PreparingExecutor(FakeExecutor):

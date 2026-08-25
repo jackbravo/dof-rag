@@ -278,6 +278,12 @@ class EvaluationService:
                             ),
                         )
                     except PublicExecutionError as exc:
+                        if exc.__cause__ is not None:
+                            LOGGER.exception(
+                                "human-evaluation run %s failed with %s",
+                                run_id,
+                                exc.code,
+                            )
                         self._append_event_if_open(
                             run_id,
                             "failed",
