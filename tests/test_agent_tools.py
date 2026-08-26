@@ -305,7 +305,7 @@ class AgentToolsTests(unittest.TestCase):
         self.assertTrue(output["ok"])
         self.assertTrue(retriever.calls[0][1]["prefer_recent"])
 
-    def test_toolbox_normalizes_string_null_for_nullable_arguments(self):
+    def test_toolbox_normalizes_string_null_and_none_for_nullable_arguments(self):
         class RecordingRetriever(FakeRetriever):
             def __init__(self):
                 self.calls = []
@@ -327,10 +327,10 @@ class AgentToolsTests(unittest.TestCase):
             {
                 "query": "tipo de cambio",
                 "strategy": "lexical",
-                "as_of": "null",
+                "as_of": "None",
                 "date_from": "null",
-                "date_to": "null",
-                "section": "null",
+                "date_to": " NONE ",
+                "section": "none",
                 "prefer_recent": "null",
                 "top_k": 5,
             },
@@ -1116,6 +1116,23 @@ class AgentToolsTests(unittest.TestCase):
         )
         self.assertEqual(answer.premise_status, "false")
         self.assertEqual(answer.citations, [4])
+
+    def test_false_premise_normalizes_unclear_with_an_affirmative_correction(self):
+        answer = _parse_final_answer(
+            '{"answer":"No reformó el artículo 123; reformó los artículos 76 y 78 '
+            'de la Ley Federal del Trabajo.","citations":[4],'
+            '"premise_status":"unclear"}',
+            {4},
+        )
+        self.assertEqual(answer.premise_status, "false")
+
+    def test_false_premise_keeps_unclear_for_a_failed_search(self):
+        answer = _parse_final_answer(
+            '{"answer":"No se encontró el decreto en los chunks leídos.",'
+            '"citations":[4],"premise_status":"unclear"}',
+            {4},
+        )
+        self.assertEqual(answer.premise_status, "unclear")
 
     def test_agent_reports_missing_false_premise_correction(self):
         backend = ScriptedBackend(

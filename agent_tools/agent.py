@@ -401,12 +401,15 @@ def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
 def _normalize_nullable_literals(
     schema: dict[str, Any], arguments: dict[str, Any]
 ) -> dict[str, Any]:
-    """Tolerate local models that serialize JSON null as the string ``null``."""
+    """Tolerate local models that serialize null as ``null`` or ``None``."""
     normalized = dict(arguments)
     properties = schema.get("properties", {})
     for name, value in arguments.items():
         expected = properties.get(name, {}).get("type")
-        if value == "null" and isinstance(expected, list) and "null" in expected:
+        is_string_null = (
+            isinstance(value, str) and value.strip().lower() in {"null", "none"}
+        )
+        if is_string_null and isinstance(expected, list) and "null" in expected:
             normalized[name] = None
     return normalized
 
@@ -1127,9 +1130,11 @@ def _parse_final_answer(
         raise CitationCoverageError(
             f"final answer requires citations from {required_hops} distinct documents"
         )
-    if data["premise_status"] == "false" and not _has_affirmative_premise_correction(
-        data["answer"]
-    ):
+    premise_status = data["premise_status"]
+    has_correction = _has_affirmative_premise_correction(data["answer"])
+    if premise_status == "unclear" and has_correction:
+        premise_status = "false"
+    if premise_status == "false" and not has_correction:
         raise PremiseCorrectionRequiredError(
             "false premise requires an affirmative correction, not only a failed search"
         )
@@ -1139,7 +1144,7 @@ def _parse_final_answer(
         invalid_citations=[
             citation for citation in proposed if citation not in allowed
         ],
-        premise_status=data["premise_status"],
+        premise_status=premise_status,
     )
 
 
