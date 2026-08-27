@@ -135,6 +135,38 @@ def _escape(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def _seconds_between(start: Any, end: Any) -> float | None:
+    """Seconds between two ISO-8601 timestamps; None when unavailable."""
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        began = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0.0, (finished - began).total_seconds())
+
+
+def _fmt_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes:
+        return f"{minutes} min {secs} s"
+    return f"{secs} s"
+
+
+def _timing_meta(run: dict[str, Any]) -> str:
+    """Split queue wait from processing time using run event timestamps."""
+    queue_wait = _seconds_between(run.get("created_at"), run.get("started_at"))
+    processing = _seconds_between(run.get("started_at"), run.get("completed_at"))
+    parts = []
+    if queue_wait is not None:
+        parts.append(f"Espera en cola: {_fmt_duration(queue_wait)}")
+    if processing is not None:
+        parts.append(f"Procesamiento: {_fmt_duration(processing)}")
+    return " · ".join(parts)
+
+
 def _csrf(request: Request) -> str:
     token = request.session.get("csrf_token")
     if not isinstance(token, str) or len(token) < 32:
@@ -685,10 +717,12 @@ data-last-event-id="{_escape(last_event_id)}" aria-live="polite">
         if csrf_token
         else ""
     )
+    timing = _timing_meta(run)
+    timing_html = f" · {_escape(timing)}" if timing else ""
     return f"""<section id="run-status" data-state="succeeded" aria-live="polite">
 <section class="panel status"><p class="eyebrow">Respuesta terminada</p><h2>Respuesta</h2>{warning_html}
 <div class="answer">{_escape(answer.get("text", ""))}</div><p><strong>Citas:</strong> {citation_links}</p>
-<p class="meta">Premisa: {_escape(answer.get("premise_status", "unknown"))} · {_escape(result.get("elapsed_ms"))} ms</p></section>
+<p class="meta">Premisa: {_escape(answer.get("premise_status", "unknown"))}{timing_html}</p></section>
 <section class="panel"><h2>Proceso de investigación</h2>
 <p class="lede">El registro de decisiones y evidencia permanece disponible después de generar la respuesta.</p>
 {_completed_process(run.get("progress", []))}</section>

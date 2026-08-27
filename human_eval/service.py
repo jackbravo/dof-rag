@@ -154,6 +154,9 @@ class EvaluationService:
             if existing is not None:
                 return existing
             if self.store.has_active_run(user_id):
+                LOGGER.warning(
+                    "admission rejected: user %s already has an active run", user_id
+                )
                 raise ActiveRunError("user already has an active run")
             if not admin:
                 if not self.store.has_review_since_last_submission(user_id):
@@ -172,6 +175,11 @@ class EvaluationService:
                     ):
                         raise QuotaExceededError("daily question limit reached")
             if self.queue.full():
+                LOGGER.warning(
+                    "admission rejected: queue full (depth=%s, capacity=%s)",
+                    self.queue.qsize(),
+                    self.queue.maxsize,
+                )
                 raise QueueFullError("execution queue is full")
             prepare_executor = getattr(self.executor, "prepare", None)
             if callable(prepare_executor):
@@ -185,6 +193,13 @@ class EvaluationService:
                 try:
                     self.queue.put_nowait(run["run_id"])
                 except queue.Full:
+                    LOGGER.warning(
+                        "admission rejected after persisting run %s: queue full "
+                        "(depth=%s, capacity=%s)",
+                        run["run_id"],
+                        self.queue.qsize(),
+                        self.queue.maxsize,
+                    )
                     self.store.append_event(
                         run["run_id"],
                         "failed",

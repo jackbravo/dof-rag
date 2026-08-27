@@ -111,6 +111,18 @@ base suficiente. Lo siguiente es:
 - conservar una forma administrativa de pausar admisión sin apagar las páginas
   publicadas.
 
+**Avance del 26 de agosto de 2026.** Ya existían la capacidad de cola (20),
+la respuesta 503 al llenarse, una sola ejecución activa por usuario y la cuota
+diaria. Ahora cada respuesta terminada separa la espera en cola del tiempo de
+procesamiento usando las marcas de `run_events`, sin instrumentación nueva, y
+cada rechazo de admisión (cola llena o ejecución activa) queda registrado en
+el log con la profundidad de la cola. Decidimos posponer `Retry-After`, la
+posición en cola y la espera estimada: con la cuota de una pregunta por día y
+una audiencia pequeña, primero queremos observar en el log con qué frecuencia
+se rechazan admisiones antes de construir esa maquinaria. Quedan pendientes de
+este apartado los timeouts por turno y por corrida, la detección del modelo
+caído antes de admitir y la pausa administrativa de admisión.
+
 Leases, reclamo atómico entre procesos y una base distinta a SQLite serán
 necesarios si llegamos a operar varios workers. No hacen falta para la primera
 beta en una sola máquina.
