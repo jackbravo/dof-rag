@@ -893,6 +893,49 @@ class ServiceTests(unittest.TestCase):
             executor.release.set()
             service.close()
 
+    def test_queue_position_wait_estimate_and_durations(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(self.store, executor, executor.provenance)
+        service.start()
+        try:
+            first = service.submit(
+                RunRequest("primera", client_request_id="q1"),
+                user_id="u1",
+                admin=True,
+            )
+            self.assertTrue(executor.started.wait(timeout=3))
+            second = service.submit(
+                RunRequest("segunda", client_request_id="q2"),
+                user_id="u2",
+                admin=True,
+            )
+            third = service.submit(
+                RunRequest("tercera", client_request_id="q3"),
+                user_id="u3",
+                admin=True,
+            )
+            queued = service.public_run(second["run_id"], admin=True)
+            self.assertEqual(queued["queue_position"], 1)
+            self.assertEqual(queued["estimated_wait_seconds"], 480)
+            behind = service.public_run(third["run_id"], admin=True)
+            self.assertEqual(behind["queue_position"], 2)
+            self.assertEqual(behind["estimated_wait_seconds"], 960)
+            # A started run has no queue position.
+            self.assertIsNone(self.store.queue_position(first["run_id"]))
+            executor.release.set()
+            wait_for_terminal(service, first["run_id"])
+            wait_for_terminal(service, second["run_id"])
+            wait_for_terminal(service, third["run_id"])
+            finished = service.public_run(second["run_id"], admin=True)
+            self.assertNotIn("queue_position", finished)
+            durations = self.store.recent_durations()
+            self.assertEqual(len(durations), 3)
+            self.assertTrue(all(value >= 0 for value in durations))
+            self.assertGreaterEqual(service.queue_retry_after(), 60)
+        finally:
+            executor.release.set()
+            service.close()
+
     def test_close_runs_the_executor_shutdown_hook(self):
         class ClosingExecutor(FakeExecutor):
             def __init__(self):
@@ -976,13 +1019,22 @@ class ServiceTests(unittest.TestCase):
 
 class AirAppTestCase(unittest.TestCase):
     daily_question_limit = 50
+    queue_capacity = 20
+
+    def make_executor(self) -> FakeExecutor:
+        return FakeExecutor()
 
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tempdir.name) / "evaluation.sqlite"
         store = EvaluationStore(self.db_path)
-        self.executor = FakeExecutor()
-        self.service = EvaluationService(store, self.executor, self.executor.provenance)
+        self.executor = self.make_executor()
+        self.service = EvaluationService(
+            store,
+            self.executor,
+            self.executor.provenance,
+            queue_capacity=self.queue_capacity,
+        )
         self.settings = WebSettings(
             host="127.0.0.1",
             port=0,
@@ -1262,6 +1314,15 @@ class AirAppTests(AirAppTestCase):
         feedback = self.service.store.feedback_for_run(run_id)
         self.assertEqual(feedback[0]["rating"], "partially_helpful")
         self.assertEqual(feedback[0]["user_id"], "alice")
+
+    def test_finished_run_splits_queue_wait_from_processing(self):
+        self.seed_and_unlock("alice")
+        run_id = self.create_run()
+        wait_for_terminal(self.service, run_id)
+        page = self.client.get(f"/runs/{run_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Espera en cola:", page.text)
+        self.assertIn("Procesamiento:", page.text)
 
     def test_progress_timeline_shows_decisions_and_expandable_chunks(self):
         rendered = _progress_timeline(
@@ -1720,6 +1781,65 @@ class DailyQuotaTests(AirAppTestCase):
         self.as_user("root", admin=True)
         admin_run = self.create_run("pregunta de administración")
         self.assertTrue(admin_run)
+
+
+class QueueAdmissionTests(AirAppTestCase):
+    queue_capacity = 1
+
+    def make_executor(self) -> BlockingExecutor:
+        return BlockingExecutor()
+
+    def post_run(self, question: str):
+        page = self.client.get("/")
+        return self.client.post(
+            "/runs",
+            data={
+                "csrf_token": self.hidden(page, "csrf_token"),
+                "client_request_id": self.hidden(page, "client_request_id"),
+                "question": question,
+                "as_of": "2026-08-17",
+                "required_hops": "1",
+            },
+            follow_redirects=False,
+        )
+
+    def test_queue_full_returns_retry_after_header(self):
+        executor = self.executor
+        assert isinstance(executor, BlockingExecutor)
+        try:
+            self.as_user("u1", admin=True)
+            self.assertEqual(self.post_run("pregunta uno").status_code, 303)
+            self.assertTrue(executor.started.wait(timeout=3))
+            self.as_user("u2", admin=True)
+            self.assertEqual(self.post_run("pregunta dos").status_code, 303)
+            self.as_user("u3", admin=True)
+            response = self.post_run("pregunta tres")
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("La cola local está llena", response.text)
+            retry_after = int(response.headers["Retry-After"])
+            self.assertGreaterEqual(retry_after, 60)
+        finally:
+            executor.release.set()
+
+    def test_queued_run_shows_position_and_estimated_wait(self):
+        executor = self.executor
+        assert isinstance(executor, BlockingExecutor)
+        try:
+            self.as_user("u1", admin=True)
+            self.assertEqual(self.post_run("pregunta uno").status_code, 303)
+            self.assertTrue(executor.started.wait(timeout=3))
+            self.as_user("u2", admin=True)
+            response = self.post_run("pregunta dos")
+            self.assertEqual(response.status_code, 303)
+            run_id = response.headers["location"].split("/")[-1]
+            page = self.client.get(f"/runs/{run_id}")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("Posición en la cola: 1", page.text)
+            self.assertIn("Espera aproximada: 8 min", page.text)
+            polled = self.client.get(f"/runs/{run_id}/status")
+            self.assertIn("Posición en la cola: 1", polled.text)
+        finally:
+            executor.release.set()
 
 
 if __name__ == "__main__":

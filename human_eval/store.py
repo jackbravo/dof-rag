@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -442,6 +443,54 @@ class EvaluationStore:
                 return connection.execute("SELECT 1").fetchone()[0] == 1
         except sqlite3.Error:
             return False
+
+    def queue_position(self, run_id: str) -> int | None:
+        """1-based FIFO position among queued runs; None when not queued."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT r.created_at FROM runs r WHERE r.run_id = ? AND "
+                "(SELECT e.event_type FROM run_events e WHERE e.run_id = r.run_id "
+                "ORDER BY e.sequence DESC LIMIT 1) = 'queued'",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            ahead = connection.execute(
+                "SELECT COUNT(*) FROM runs r WHERE "
+                "(SELECT e.event_type FROM run_events e WHERE e.run_id = r.run_id "
+                "ORDER BY e.sequence DESC LIMIT 1) = 'queued' AND "
+                "(r.created_at < ? OR (r.created_at = ? AND r.run_id < ?))",
+                (row["created_at"], row["created_at"], run_id),
+            ).fetchone()
+        return int(ahead[0]) + 1
+
+    def recent_durations(self, *, limit: int = 10) -> list[float]:
+        """Inference seconds (started -> terminal) of recent finished runs."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT started.created_at AS started_at, "
+                "finished.created_at AS finished_at "
+                "FROM run_events started "
+                "JOIN run_events finished ON finished.run_id = started.run_id "
+                "AND finished.sequence = started.sequence + 1 "
+                "WHERE started.event_type = 'started' "
+                "AND finished.event_type IN ('succeeded', 'failed') "
+                "ORDER BY finished.created_at DESC, finished.run_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        durations: list[float] = []
+        for row in rows:
+            try:
+                began = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+                ended = datetime.fromisoformat(
+                    row["finished_at"].replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                continue
+            durations.append(max(0.0, (ended - began).total_seconds()))
+        return durations
 
     def append_event(
         self, run_id: str, event_type: str, payload: dict[str, Any] | None = None

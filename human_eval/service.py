@@ -53,6 +53,12 @@ class ReviewRequiredError(RuntimeError):
     """The user must evaluate a published answer before asking a question."""
 
 
+# Fallback per-run inference estimate when no run has finished yet. From the
+# first local measurements (244-1,136 s per question); used only until
+# recent_durations() has real samples.
+DEFAULT_RUN_SECONDS = 480.0
+
+
 class EvaluationService:
     def __init__(
         self,
@@ -228,7 +234,29 @@ class EvaluationService:
             if user_id is None or not self.store.run_belongs_to(run_id, user_id):
                 raise KeyError(run_id)
         run["events_url"] = f"/runs/{run_id}/events"
+        if run["status"] == "queued":
+            position = self.store.queue_position(run_id)
+            if position is not None:
+                run["queue_position"] = position
+                run["estimated_wait_seconds"] = self.estimated_wait_seconds(position)
         return run
+
+    def estimated_wait_seconds(self, position: int) -> int:
+        """Rough wait for a queued run at a 1-based FIFO position."""
+        durations = self.store.recent_durations(limit=10)
+        average = (
+            sum(durations) / len(durations) if durations else DEFAULT_RUN_SECONDS
+        )
+        return max(1, int(round(position * average)))
+
+    def queue_retry_after(self) -> int:
+        """Seconds a client should wait before retrying a full queue."""
+        durations = self.store.recent_durations(limit=10)
+        average = (
+            sum(durations) / len(durations) if durations else DEFAULT_RUN_SECONDS
+        )
+        depth = max(self.queue.qsize(), 1)
+        return max(60, int(round(depth * average)))
 
     @staticmethod
     def _is_public(run: dict[str, Any]) -> bool:
