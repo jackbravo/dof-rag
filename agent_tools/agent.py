@@ -222,6 +222,35 @@ def _has_affirmative_premise_correction(answer: str) -> bool:
     return False
 
 
+def _has_explicit_premise_correction(answer: str) -> bool:
+    """Detect an explicit negation-plus-correction structure.
+
+    Stricter than ``_has_affirmative_premise_correction``: that helper treats
+    any clause with a verb like ``vigente`` or ``establece`` as a correction,
+    which is safe only as validation after the model already chose ``false``.
+    Inferring ``false`` from an ``unclear`` status requires the answer to
+    negate the premise (``no ...`` or a ``sino`` contrast) and then state
+    affirmatively what holds instead.
+    """
+    clauses = [
+        clause
+        for clause in re.split(r"[.;]\s*", _fold_for_coverage(answer))
+        if clause
+    ]
+    premise_denied = False
+    for clause in clauses:
+        if " sino " in f" {clause} " and CORRECTION_ASSERTION_RE.search(clause):
+            return True
+        if SEARCH_FAILURE_RE.search(clause):
+            continue
+        if clause.startswith("no "):
+            premise_denied = True
+            continue
+        if premise_denied and CORRECTION_ASSERTION_RE.search(clause):
+            return True
+    return False
+
+
 FINAL_ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -344,9 +373,15 @@ class AgentAnswer:
     citations: list[int]
     invalid_citations: list[int]
     premise_status: str
+    # What the model wrote before any normalization; equal to premise_status
+    # unless an explicit correction upgraded an ``unclear`` status.
+    premise_status_reported: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if not data["premise_status_reported"]:
+            data["premise_status_reported"] = data["premise_status"]
+        return data
 
 
 class CitationRequiredError(ValueError):
@@ -1132,7 +1167,10 @@ def _parse_final_answer(
         )
     premise_status = data["premise_status"]
     has_correction = _has_affirmative_premise_correction(data["answer"])
-    if premise_status == "unclear" and has_correction:
+    premise_status_reported = premise_status
+    if premise_status == "unclear" and _has_explicit_premise_correction(
+        data["answer"]
+    ):
         premise_status = "false"
     if premise_status == "false" and not has_correction:
         raise PremiseCorrectionRequiredError(
@@ -1145,6 +1183,7 @@ def _parse_final_answer(
             citation for citation in proposed if citation not in allowed
         ],
         premise_status=premise_status,
+        premise_status_reported=premise_status_reported,
     )
 
 
