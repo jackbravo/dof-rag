@@ -155,7 +155,10 @@ class EvaluationService:
                 return existing
             if self.store.has_active_run(user_id):
                 LOGGER.warning(
-                    "admission rejected: user %s already has an active run", user_id
+                    "admission rejected: active run exists "
+                    "(depth=%s, capacity=%s)",
+                    self.queue.qsize(),
+                    self.queue.maxsize,
                 )
                 raise ActiveRunError("user already has an active run")
             if not admin:

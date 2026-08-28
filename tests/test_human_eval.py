@@ -925,6 +925,35 @@ class ServiceTests(unittest.TestCase):
             executor.release.set()
             service.close()
 
+    def test_active_run_rejection_is_logged_without_user_id(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store, executor, executor.provenance, queue_capacity=2
+        )
+        service.start()
+        try:
+            service.submit(
+                RunRequest("primera", client_request_id="active-1"),
+                user_id="sensitive-user-id",
+                admin=True,
+            )
+            self.assertTrue(executor.started.wait(timeout=3))
+            with self.assertLogs("human_eval.service", level="WARNING") as captured:
+                with self.assertRaises(ActiveRunError):
+                    service.submit(
+                        RunRequest("segunda", client_request_id="active-2"),
+                        user_id="sensitive-user-id",
+                        admin=True,
+                    )
+            message = captured.output[0]
+            self.assertIn("active run exists", message)
+            self.assertIn("depth=0", message)
+            self.assertIn("capacity=2", message)
+            self.assertNotIn("sensitive-user-id", message)
+        finally:
+            executor.release.set()
+            service.close()
+
     def test_close_runs_the_executor_shutdown_hook(self):
         class ClosingExecutor(FakeExecutor):
             def __init__(self):
