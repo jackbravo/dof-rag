@@ -17,6 +17,7 @@ Usage:
     python convert_doc_to_md.py                          # Convert all years
     python convert_doc_to_md.py --years 2020 2021 2022   # Specific years
     python convert_doc_to_md.py --workers 4              # Limit parallelism
+    python convert_doc_to_md.py --start-date 2026-08-24 --end-date 2026-08-27
     python convert_doc_to_md.py --dry-run                # Just count files
     python convert_doc_to_md.py --retry-failed           # Retry only failed files
     python convert_doc_to_md.py --input-dir /path/to/docs --output-dir /path/to/md
@@ -30,6 +31,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date, datetime
 from pathlib import Path
 
 # Configuration
@@ -235,8 +237,20 @@ def get_output_path(doc_path: Path) -> Path:
     return OUTPUT_DIR / rel.with_suffix(".md")
 
 
-def find_doc_files(years=None):
-    """Find all .doc files, optionally filtered by years."""
+def publication_date_from_path(path: Path) -> date | None:
+    """Read YYYY/MM/DDMMYYYY from a canonical dof_word path."""
+    try:
+        parts = path.relative_to(INPUT_DIR).parts
+        if len(parts) < 3:
+            return None
+        return datetime.strptime(parts[2], "%d%m%Y").date()
+    except (ValueError, OSError):
+        return None
+
+
+def find_doc_files(years=None, start_date: date | None = None,
+                   end_date: date | None = None):
+    """Find .doc files, optionally filtered by years and publication date."""
     files = []
     if years:
         for year in years:
@@ -248,6 +262,25 @@ def find_doc_files(years=None):
     else:
         files = sorted(INPUT_DIR.rglob("*.doc"))
         log.info(f"Total: {len(files)} .doc files")
+    if start_date or end_date:
+        selected = []
+        for path in files:
+            publication_date = publication_date_from_path(path)
+            if publication_date is None:
+                log.warning(f"Ignoring .doc outside canonical date layout: {path}")
+                continue
+            if start_date and publication_date < start_date:
+                continue
+            if end_date and publication_date > end_date:
+                continue
+            selected.append(path)
+        files = selected
+        log.info(
+            "Date window %s..%s: %d .doc files",
+            start_date or "unbounded",
+            end_date or "unbounded",
+            len(files),
+        )
     return files
 
 
@@ -270,7 +303,14 @@ def main():
                         help="Input directory with .doc files (default: ./dof_word)")
     parser.add_argument("--output-dir", type=str, default="./dof_md",
                         help="Output directory for .md files (default: ./dof_md)")
+    parser.add_argument("--start-date", type=date.fromisoformat,
+                        help="Only convert files on/after YYYY-MM-DD")
+    parser.add_argument("--end-date", type=date.fromisoformat,
+                        help="Only convert files on/before YYYY-MM-DD")
     args = parser.parse_args()
+
+    if args.start_date and args.end_date and args.start_date > args.end_date:
+        parser.error("--start-date must not be after --end-date")
 
     global INPUT_DIR, OUTPUT_DIR, FAILED_DIR
     INPUT_DIR = Path(args.input_dir)
@@ -289,7 +329,7 @@ def main():
         log.info("Years: ALL")
     log.info("=" * 60)
 
-    files = find_doc_files(args.years)
+    files = find_doc_files(args.years, args.start_date, args.end_date)
     if not files:
         log.warning("No .doc files found!")
         return

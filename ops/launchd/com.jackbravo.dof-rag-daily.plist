@@ -29,6 +29,11 @@
     <string>Background</string>
     <key>LowPriorityIO</key>
     <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DOF_REPO_DIR</key>
+        <string>@DOF_REPO_DIR@</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>@DOF_LOG_DIR@/dof-daily.log</string>
     <key>StandardErrorPath</key>

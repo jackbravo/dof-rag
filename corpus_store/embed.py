@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
     embedding BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS vector_deletions (
+    chunk_id INTEGER PRIMARY KEY,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 INSERT_EVERY = 2048  # vectors per committed batch
@@ -203,6 +207,35 @@ def iter_pending(chunks: sqlite3.Connection, after_id: int):
         yield from rows
 
 
+def apply_chunk_vector_invalidations(
+    chunks: sqlite3.Connection, vectors: sqlite3.Connection
+) -> int:
+    """Delete stale embeddings and durably queue matching vec0 deletions."""
+    chunk_ids = [
+        int(row[0])
+        for row in chunks.execute(
+            "SELECT chunk_id FROM chunk_vector_invalidations ORDER BY chunk_id"
+        )
+    ]
+    if not chunk_ids:
+        return 0
+    with vectors:
+        vectors.executemany(
+            "DELETE FROM chunk_vectors WHERE chunk_id = ?",
+            [(chunk_id,) for chunk_id in chunk_ids],
+        )
+        vectors.executemany(
+            "INSERT OR IGNORE INTO vector_deletions(chunk_id) VALUES (?)",
+            [(chunk_id,) for chunk_id in chunk_ids],
+        )
+    with chunks:
+        chunks.executemany(
+            "DELETE FROM chunk_vector_invalidations WHERE chunk_id = ?",
+            [(chunk_id,) for chunk_id in chunk_ids],
+        )
+    return len(chunk_ids)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus-db", required=True)
@@ -232,12 +265,17 @@ def main() -> None:
     vectors = (init_vectors_db(vectors_path, meta) if fresh
                else sqlite3.connect(str(vectors_path)))
     if not fresh:
+        vectors.executescript(SCHEMA)
+        vectors.commit()
         check_meta(vectors, meta)
-    last_id = vectors.execute(
-        "SELECT COALESCE(MAX(chunk_id), 0) FROM chunk_vectors").fetchone()[0]
 
     corpus = connect(args.corpus_db)
     chunks = sqlite3.connect(args.chunks_db)
+    invalidated = apply_chunk_vector_invalidations(chunks, vectors)
+    if invalidated:
+        print(f"invalidated {invalidated:,} stale chunk vectors", flush=True)
+    last_id = vectors.execute(
+        "SELECT COALESCE(MAX(chunk_id), 0) FROM chunk_vectors").fetchone()[0]
     total = chunks.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     pending_total = total - chunks.execute(
         "SELECT COUNT(*) FROM chunks WHERE chunk_id <= ?", (last_id,)).fetchone()[0]
@@ -246,6 +284,9 @@ def main() -> None:
     print(f"{total:,} chunks in store, {last_id:,} already embedded, "
           f"embedding {pending_total:,}", flush=True)
     if pending_total == 0:
+        corpus.close()
+        chunks.close()
+        vectors.close()
         return
 
     proc = start_server(args.gguf, args.ctx, args.port)
@@ -289,6 +330,8 @@ def main() -> None:
     finally:
         stop_server(proc)
     vectors.close()
+    chunks.close()
+    corpus.close()
 
 
 def flush(vectors: sqlite3.Connection, buf: list[tuple[int, str]],

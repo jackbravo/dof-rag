@@ -12,22 +12,45 @@ target_runner="$support_dir/run_dof_daily.sh"
 domain="gui/$(id -u)"
 label="com.jackbravo.dof-rag-daily"
 
-mkdir -p "$target_dir" "$support_dir" "$repo_dir/logs"
 plutil -lint "$source_plist"
+
+render_plist() {
+    local destination=$1
+    local runner=$2
+    local repository=$3
+
+    # Let plutil write path values. Unlike sed string replacement, this
+    # preserves spaces and XML-special characters in paths.
+    install -m 0644 "$source_plist" "$destination"
+    plutil -replace ProgramArguments.5 -string "$runner" "$destination"
+    plutil -replace EnvironmentVariables.DOF_REPO_DIR \
+        -string "$repository" "$destination"
+    plutil -replace StandardOutPath \
+        -string "$repository/logs/dof-daily.log" "$destination"
+    plutil -replace StandardErrorPath \
+        -string "$repository/logs/dof-daily.error.log" "$destination"
+    plutil -lint "$destination"
+}
+
+if [[ ${1:-} == "--render-plist" ]]; then
+    if (( $# != 4 )); then
+        print -u2 "usage: $0 --render-plist OUTPUT RUNNER REPOSITORY"
+        exit 2
+    fi
+    render_plist "$2" "$3" "$4"
+    exit 0
+fi
+
+mkdir -p "$target_dir" "$support_dir" "$repo_dir/logs"
+temporary_plist="$target_plist.new"
+render_plist "$temporary_plist" "$target_runner" "$repo_dir"
+install -m 0755 "$source_runner" "$target_runner"
 
 if launchctl print "$domain/$label" >/dev/null 2>&1; then
     launchctl bootout "$domain/$label"
 fi
 
-# The checked-in plist and runner are templates: bake this account's paths in
-# at install time so the job works from any checkout, not just one developer's.
-sed -e "s|@DOF_RUNNER@|$target_runner|g" \
-    -e "s|@DOF_LOG_DIR@|$repo_dir/logs|g" \
-    "$source_plist" > "$target_plist"
-chmod 0644 "$target_plist"
-
-sed "s|^repo_dir=.*|repo_dir="$repo_dir"|" "$source_runner" > "$target_runner"
-chmod 0755 "$target_runner"
+mv "$temporary_plist" "$target_plist"
 
 launchctl bootstrap "$domain" "$target_plist"
 launchctl enable "$domain/$label"

@@ -13,13 +13,41 @@ Usage:
 
 import argparse
 import sqlite3
-import sys
 import time
 from pathlib import Path
 
 import sqlite_vec
 
 DDL = "CREATE VIRTUAL TABLE chunk_vec USING vec0(embedding bit[1024])"
+DELETIONS_DDL = """
+CREATE TABLE IF NOT EXISTS vector_deletions (
+    chunk_id INTEGER PRIMARY KEY,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+
+def apply_vector_deletions(conn, vectors) -> int:
+    """Remove stale vec0 rows, then acknowledge the durable deletion queue."""
+    chunk_ids = [
+        int(row[0])
+        for row in vectors.execute(
+            "SELECT chunk_id FROM vector_deletions ORDER BY chunk_id"
+        )
+    ]
+    if not chunk_ids:
+        return 0
+    with conn:
+        conn.executemany(
+            "DELETE FROM chunk_vec WHERE rowid = ?",
+            [(chunk_id,) for chunk_id in chunk_ids],
+        )
+    with vectors:
+        vectors.executemany(
+            "DELETE FROM vector_deletions WHERE chunk_id = ?",
+            [(chunk_id,) for chunk_id in chunk_ids],
+        )
+    return len(chunk_ids)
 
 
 def main() -> None:
@@ -42,12 +70,18 @@ def main() -> None:
         conn.commit()
         print("created chunk_vec vec0(bit[1024])", flush=True)
 
+    vectors = sqlite3.connect(args.vectors_db)
+    vectors.execute(DELETIONS_DDL)
+    vectors.commit()
+    invalidated = apply_vector_deletions(conn, vectors)
+    if invalidated:
+        print(f"invalidated {invalidated:,} stale vec0 vectors", flush=True)
+
     lo = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM chunk_vec")
     lo = lo.fetchone()[0]
     if lo:
         print(f"resuming after rowid {lo:,}", flush=True)
 
-    vectors = sqlite3.connect(args.vectors_db)
     total = vectors.execute(
         "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id > ?",
         (lo,)).fetchone()[0]

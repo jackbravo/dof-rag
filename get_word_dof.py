@@ -154,6 +154,41 @@ def extract_notice_links(html_content: str) -> List[tuple[str, str]]:
     return notice_links
 
 
+def is_valid_dof_listing(
+    html_content: str, date_str: str, edition: str
+) -> bool:
+    """Recognize a populated listing or an explicit validated empty date."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    title = soup.title.get_text(" ", strip=True).casefold() if soup.title else ""
+    if "diario oficial de la federación" not in title:
+        return False
+    if soup.find(id="cuerpo_principal") is None:
+        return False
+
+    text = " ".join(soup.stripped_strings).casefold()
+    edition_name = {"MAT": "matutina", "VES": "vespertina"}.get(edition)
+    if not edition_name:
+        return False
+    expected_header = f"fecha: {date_str} - edición {edition_name}".casefold()
+    return (
+        expected_header in text
+        or "no hay datos para la fecha seleccionada" in text
+    )
+
+
+def is_valid_sidof_listing(
+    html_content: str, day: str, month: str, year: str
+) -> bool:
+    """Require the dated SIDOF publication shell before accepting no notices."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    title = soup.title.get_text(" ", strip=True).casefold() if soup.title else ""
+    if "diario oficial de la federación" not in title:
+        return False
+    if f"{day}-{month}-{year}" not in html_content:
+        return False
+    return soup.find(id="resp-tab2") is not None or soup.find(id="resp-tab3") is not None
+
+
 def _download_file(session: requests.Session, url: str, output_path: Path, file_type: str = "file") -> bool:
     """
     Internal function to download a file from a URL
@@ -267,12 +302,21 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
     Returns:
         Number of notice files downloaded successfully
     """
+    global ERROR_COUNT
     sidof_url = f"https://sidof.segob.gob.mx/welcome/{day}-{month}-{year}"
     
     try:
         logging.info(f"Processing SIDOF page: {sidof_url}")
         response = session.get(sidof_url, timeout=30)
         response.raise_for_status()
+
+        if not is_valid_sidof_listing(response.text, day, month, year):
+            ERROR_COUNT += 1
+            logging.error(
+                f"SIDOF returned an unrecognized listing for "
+                f"{day}/{month}/{year}; refusing to validate an empty date"
+            )
+            return 0
         
         notice_links = extract_notice_links(response.text)
         
@@ -308,7 +352,6 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
         return downloaded_count
         
     except Exception as e:
-        global ERROR_COUNT
         ERROR_COUNT += 1
         logging.error(f"Error processing SIDOF page {sidof_url}: {e}")
         return 0
@@ -328,6 +371,7 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
     Returns:
         Number of files downloaded successfully
     """
+    global ERROR_COUNT
     day, month, year = date_str.split('/')
     
     dof_url = f"https://www.dof.gob.mx/index.php?year={year}&month={month}&day={day}&edicion={edition}"
@@ -337,7 +381,15 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
         response = session.get(dof_url, timeout=30)
         response.raise_for_status()
         
-        word_links = extract_word_links(response.text)
+        if is_valid_dof_listing(response.text, date_str, edition):
+            word_links = extract_word_links(response.text)
+        else:
+            ERROR_COUNT += 1
+            logging.error(
+                f"DOF returned an unrecognized listing for {date_str} - {edition}; "
+                "refusing to validate an empty date"
+            )
+            word_links = []
         downloaded_count = 0
 
         if not word_links:
@@ -371,7 +423,6 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
         return downloaded_count
         
     except Exception as e:
-        global ERROR_COUNT
         ERROR_COUNT += 1
         logging.error(f"Error processing page {dof_url}: {e}")
         return 0
@@ -408,6 +459,9 @@ def main(
     python get_word_dof.py 01/01/2023 31/01/2023 --output-dir ./dof --editions both --sleep-delay 1.5
     """
     
+    global ERROR_COUNT
+    ERROR_COUNT = 0
+
     log_levels = {
         'DEBUG': logging.DEBUG,
         'INFO': logging.INFO,

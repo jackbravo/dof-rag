@@ -25,6 +25,7 @@ from pathlib import Path
 import sqlite_vec
 
 from corpus_store.db import connect
+from corpus_store.ingest import REPAIRS_DDL
 from corpus_store.sampler import parse_metadata
 
 REPO = Path(__file__).resolve().parent.parent
@@ -107,6 +108,11 @@ def write_state(path: Path, completed: date) -> None:
     temporary.replace(path)
 
 
+def non_regressing_watermark(current: date | None, completed: date) -> date:
+    """A successful historical window must never move state backward."""
+    return max(current, completed) if current is not None else completed
+
+
 def build_manifest(corpus: Path, start: date, end: date, output: Path) -> int:
     """Write a small manifest containing Markdown files in the update window."""
     records: list[dict] = []
@@ -160,6 +166,29 @@ def run_step(label: str, command: list[str], *, check: bool = True) -> int:
     return result.returncode
 
 
+def conversion_command(
+    args: argparse.Namespace, start: date, end: date
+) -> list[str]:
+    """Build a converter command scoped to the active publication window."""
+    years = [str(year) for year in range(start.year, end.year + 1)]
+    return [
+        sys.executable,
+        "convert_doc_to_md.py",
+        "--years",
+        *years,
+        "--start-date",
+        start.isoformat(),
+        "--end-date",
+        end.isoformat(),
+        "--workers",
+        str(args.workers),
+        "--input-dir",
+        str(args.word_dir),
+        "--output-dir",
+        str(args.corpus),
+    ]
+
+
 def preflight(args: argparse.Namespace) -> None:
     required_files = [
         args.corpus_db,
@@ -186,18 +215,50 @@ def preflight(args: argparse.Namespace) -> None:
         )
 
 
+def ensure_repair_schema(args: argparse.Namespace) -> None:
+    """Migrate the three writable stores before taking the initial snapshot."""
+    with closing(connect(args.corpus_db)) as corpus:
+        corpus.executescript(REPAIRS_DDL)
+        corpus.commit()
+    with closing(sqlite3.connect(args.chunks_db)) as chunks:
+        chunks.execute(
+            "CREATE TABLE IF NOT EXISTS chunk_vector_invalidations ("
+            " chunk_id INTEGER PRIMARY KEY,"
+            " invalidated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        chunks.commit()
+    with closing(sqlite3.connect(args.vectors_db)) as vectors:
+        vectors.execute(
+            "CREATE TABLE IF NOT EXISTS vector_deletions ("
+            " chunk_id INTEGER PRIMARY KEY,"
+            " recorded_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        vectors.commit()
+
+
 def snapshot(args: argparse.Namespace) -> dict[str, int | str | None]:
     with closing(connect(args.corpus_db)) as corpus:
         documents, latest, max_document = corpus.execute(
             "SELECT COUNT(*), MAX(publication_date), MAX(document_id) FROM documents"
         ).fetchone()
         fts = corpus.execute("SELECT COUNT(*) FROM documents_fts_docsize").fetchone()[0]
+        pending_repairs = corpus.execute(
+            "SELECT COUNT(*) FROM document_repairs"
+            " WHERE fts_pending = 1 OR chunks_pending = 1"
+        ).fetchone()[0]
     with closing(sqlite3.connect(args.chunks_db)) as chunks_db:
-        chunks, max_chunk_document = chunks_db.execute(
-            "SELECT COUNT(*), MAX(document_id) FROM chunks"
+        chunks, chunk_documents, max_chunk_document = chunks_db.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT document_id), MAX(document_id)"
+            " FROM chunks"
         ).fetchone()
+        pending_chunk_invalidations = chunks_db.execute(
+            "SELECT COUNT(*) FROM chunk_vector_invalidations"
+        ).fetchone()[0]
     with closing(sqlite3.connect(args.vectors_db)) as vectors_db:
         vectors = vectors_db.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0]
+        pending_vector_deletions = vectors_db.execute(
+            "SELECT COUNT(*) FROM vector_deletions"
+        ).fetchone()[0]
     with closing(sqlite3.connect(args.vec0_db)) as vec0_db:
         vec0_db.enable_load_extension(True)
         sqlite_vec.load(vec0_db)
@@ -207,9 +268,13 @@ def snapshot(args: argparse.Namespace) -> dict[str, int | str | None]:
         "latest_publication": latest,
         "max_document_id": max_document,
         "fts_documents": fts,
+        "pending_repairs": pending_repairs,
         "chunks": chunks,
+        "chunk_documents": chunk_documents,
         "max_chunk_document_id": max_chunk_document,
+        "pending_chunk_invalidations": pending_chunk_invalidations,
         "vectors": vectors,
+        "pending_vector_deletions": pending_vector_deletions,
         "vec0_vectors": vec0,
     }
 
@@ -217,12 +282,20 @@ def snapshot(args: argparse.Namespace) -> dict[str, int | str | None]:
 def verify(state: dict[str, int | str | None], *, embeddings_complete: bool) -> None:
     if state["documents"] != state["fts_documents"]:
         raise RuntimeError(f"FTS coverage mismatch: {state}")
+    if state["pending_repairs"]:
+        raise RuntimeError(f"pending corpus repairs: {state}")
+    if state["documents"] != state["chunk_documents"]:
+        raise RuntimeError(f"chunk document coverage mismatch: {state}")
     if state["max_document_id"] != state["max_chunk_document_id"]:
         raise RuntimeError(f"chunk coverage mismatch: {state}")
     if embeddings_complete and state["chunks"] != state["vectors"]:
         raise RuntimeError(f"embedding coverage mismatch: {state}")
+    if embeddings_complete and state["pending_chunk_invalidations"]:
+        raise RuntimeError(f"pending chunk-vector invalidations: {state}")
     if state["vectors"] != state["vec0_vectors"]:
         raise RuntimeError(f"vec0 coverage mismatch: {state}")
+    if state["pending_vector_deletions"]:
+        raise RuntimeError(f"pending vec0 deletions: {state}")
 
 
 def acquire_lock(path: Path):
@@ -314,6 +387,7 @@ def main() -> int:
 
     try:
         preflight(args)
+        ensure_repair_schema(args)
         before = snapshot(args)
         LOG.info("before=%s", json.dumps(before, sort_keys=True))
 
@@ -334,21 +408,9 @@ def main() -> int:
             check=False,
         )
 
-        years = [str(year) for year in range(start.year, args.end_date.year + 1)]
         conversion_code = run_step(
             "convert",
-            [
-                sys.executable,
-                "convert_doc_to_md.py",
-                "--years",
-                *years,
-                "--workers",
-                str(args.workers),
-                "--input-dir",
-                str(args.word_dir),
-                "--output-dir",
-                str(args.corpus),
-            ],
+            conversion_command(args, start, args.end_date),
             check=False,
         )
 
@@ -438,8 +500,9 @@ def main() -> int:
                 + "; completed files were indexed and the next run will retry the rest"
             )
         if watermark is None or start <= watermark + timedelta(days=1):
-            write_state(args.state, args.end_date)
-            LOG.info("completed_through=%s", args.end_date)
+            completed = non_regressing_watermark(watermark, args.end_date)
+            write_state(args.state, completed)
+            LOG.info("completed_through=%s", completed)
         else:
             LOG.info(
                 "leaving completed_through=%s unchanged after non-contiguous test window",

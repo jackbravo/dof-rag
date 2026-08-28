@@ -1,10 +1,9 @@
 #!/bin/zsh
 set -eu
 
-# Self-locate the repository when run from a checkout (e.g. --dry-run tests).
-# install_dof_launchd.sh replaces this line with the absolute repository path
-# baked into the copy installed under ~/Library/Application Support/DOF-RAG.
-repo_dir=$(cd -- "${0:A:h}/.." && pwd)
+# Direct use self-locates from scripts/. The installed launchd plist sets the
+# exact checkout path, allowing the copied runner to live in Application Support.
+repo_dir="${DOF_REPO_DIR:-$(cd -- "${0:A:h}/.." && pwd)}"
 
 export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:/Applications/LibreOffice.app/Contents/MacOS:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PYTHONUNBUFFERED=1

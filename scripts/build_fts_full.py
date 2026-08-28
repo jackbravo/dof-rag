@@ -20,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from corpus_store.db import connect, fetch_document_text  # noqa: E402
+from corpus_store.ingest import REPAIRS_DDL  # noqa: E402
 
 FTS_DDL = """CREATE VIRTUAL TABLE documents_fts USING fts5(
     markdown, content='documents', content_rowid='document_id',
@@ -40,6 +41,46 @@ def set_meta(conn, key: str, value: int) -> None:
     conn.execute(
         "INSERT INTO _fts_build_meta(k, v) VALUES (?, ?) "
         "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, value))
+
+
+def repair_fts_documents(conn) -> tuple[int, int]:
+    """Reindex repaired rows using the exact text previously in FTS5."""
+    repairs = conn.execute(
+        "SELECT document_id, previous_markdown FROM document_repairs"
+        " WHERE fts_pending = 1 ORDER BY document_id"
+    ).fetchall()
+    if not repairs:
+        return 0, 0
+
+    newly_indexed = 0
+    with conn:
+        for document_id, previous_markdown in repairs:
+            indexed = conn.execute(
+                "SELECT 1 FROM documents_fts_docsize WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            if indexed:
+                if previous_markdown is None:
+                    raise RuntimeError(
+                        f"repair {document_id} lacks previous FTS text"
+                    )
+                conn.execute(
+                    "INSERT INTO documents_fts"
+                    " (documents_fts, rowid, markdown) VALUES ('delete', ?, ?)",
+                    (document_id, previous_markdown),
+                )
+            else:
+                newly_indexed += 1
+            conn.execute(
+                "INSERT INTO documents_fts(rowid, markdown) VALUES (?, ?)",
+                (document_id, fetch_document_text(conn, document_id)),
+            )
+            conn.execute(
+                "UPDATE document_repairs SET fts_pending = 0,"
+                " previous_markdown = NULL WHERE document_id = ?",
+                (document_id,),
+            )
+    return len(repairs), newly_indexed
 
 
 def main() -> None:
@@ -70,7 +111,12 @@ def main() -> None:
         conn.commit()
         print(f"created documents_fts ({time.time() - t0:.0f}s)", flush=True)
     conn.execute(META_DDL)
+    conn.executescript(REPAIRS_DDL)
     conn.commit()
+
+    repaired, _ = repair_fts_documents(conn)
+    if repaired:
+        print(f"reindexed {repaired} repaired FTS documents", flush=True)
 
     total = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     max_id = conn.execute("SELECT MAX(document_id) FROM documents").fetchone()[0]
