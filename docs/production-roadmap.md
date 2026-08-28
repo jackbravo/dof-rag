@@ -73,6 +73,25 @@ El primer paquete de cambios será:
 Cada reducción debe pasar eval-v4. No aceptaremos una mejora de latencia que
 empeore cobertura, uso de herramientas o precisión de citas.
 
+**Avance del 25 de agosto de 2026.** El agente ya separa el resultado completo,
+que permanece en la traza, de la versión compacta que recibe el modelo. En una
+repetición de SP-002 con la misma configuración, los tokens totales bajaron de
+24,410 a 12,590 y el tiempo de 403 a 259 segundos; ambos intentos terminaron con
+la cita correcta al chunk `1342011`. En la corrida nueva, los tres resultados de
+herramientas ocuparon 16,825 bytes completos y 8,659 bytes frente al modelo.
+Es una medición de una sola pregunta y Qwen puede variar entre corridas, así que
+la tomamos como señal prometedora, no como cifra definitiva de capacidad.
+
+Después corrimos una pregunta de cada una de las siete categorías de eval-v4.
+Las siete localizaron la evidencia esperada después de aceptar que Qwen también
+puede escribir `"None"` para un valor nulo. En el caso de premisa falsa, el
+modelo dejó el estado en `unclear` aunque el texto contenía una corrección
+afirmativa; conservamos ese estado y marcamos la respuesta para revisión, en vez
+de cambiarlo con una heurística. La recuperación de citas fue completa y la
+precisión automática fue 0.86 por dos citas adicionales. El tiempo varió de 244
+a 1,136 segundos, con un promedio de 458; la cola larga importa mucho más que
+el promedio para decidir la capacidad inicial.
+
 ### 2. Construir una línea base que podamos repetir
 
 La siguiente medición debe incluir preguntas fáciles, multi-documento, de fecha
@@ -91,6 +110,21 @@ cuando el servidor lo soporte de forma estable, MTP o un modelo de borrador.
 
 Qwen3.8-27B es el primer candidato, no una obligación. Usaremos la misma muestra
 para comparar cuantizaciones, otros modelos y equipos Apple o NVIDIA.
+
+MTP merece una prueba distinta por plataforma. Qwen3.8 ya incluye la cabeza de
+predicción y `llama-server` puede activarla sin descargar otro modelo. Los
+resultados publicados hasta ahora son buenos en varias tarjetas NVIDIA, pero no
+se trasladan directamente a Metal: en Apple Silicon la verificación de lotes
+pequeños puede comerse el ahorro, sobre todo en prosa.
+
+En nuestro M3 Pro, SP-002 con `draft-mtp` y dos tokens de borrador conservó la
+cita correcta. La generación subió de unos 7.5 a entre 8.3 y 8.7 tokens por
+segundo, pero la corrida completa tardó 356 segundos, contra 259 sin MTP. El
+modelo también generó más razonamiento y procesó más contexto, así que no es una
+comparación controlada suficiente para atribuir toda la diferencia a MTP. Por
+ahora no será el valor predeterminado en Mac. Lo volveremos a medir con una
+muestra fija, varias repeticiones y un `llama.cpp` reciente; en NVIDIA tendrá su
+propio barrido de profundidad y memoria.
 
 ### 3. Poner admisión delante del modelo
 
@@ -172,11 +206,11 @@ inferencia. Eso permite cambiar una pieza sin rehacer el proyecto.
 
 ## Próximos tres entregables
 
-1. Un reporte reproducible con 10 a 20 preguntas y métricas por turno.
-2. Resultados de herramientas compactos, con comparación antes/después en
-   tokens, latencia y calidad.
-3. Admisión con capacidad global, cola visible, `Retry-After` y métricas de
+1. Ampliar la comparación de resultados compactos a 10 o 20 preguntas, con
+   métricas por turno y revisión de calidad.
+2. Admisión con capacidad global, cola visible, `Retry-After` y métricas de
    espera.
+3. Una línea base de uno y dos slots para fijar la concurrencia inicial.
 
 Después de esos tres trabajos podremos fijar una concurrencia inicial y abrir
 una beta pequeña con datos, no con estimaciones.

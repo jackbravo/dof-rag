@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from agent_tools.agent import (
     FINAL_ANSWER_SCHEMA,
+    AgentAnswer,
     AgentRunner,
     DofToolbox,
     ModelTurn,
@@ -14,8 +15,10 @@ from agent_tools.agent import (
     _coverage_requirements,
     _enumeration_requirements,
     _explicit_question_requirements,
+    _model_tool_output,
     _parse_final_answer,
     _query_snippet,
+    _verification,
 )
 from agent_tools.headers import extract_document_header
 from agent_tools.llm import _parse_json, answer_with_context
@@ -304,7 +307,7 @@ class AgentToolsTests(unittest.TestCase):
         self.assertTrue(output["ok"])
         self.assertTrue(retriever.calls[0][1]["prefer_recent"])
 
-    def test_toolbox_normalizes_string_null_for_nullable_arguments(self):
+    def test_toolbox_normalizes_string_null_and_none_for_nullable_arguments(self):
         class RecordingRetriever(FakeRetriever):
             def __init__(self):
                 self.calls = []
@@ -326,10 +329,10 @@ class AgentToolsTests(unittest.TestCase):
             {
                 "query": "tipo de cambio",
                 "strategy": "lexical",
-                "as_of": "null",
+                "as_of": "None",
                 "date_from": "null",
-                "date_to": "null",
-                "section": "null",
+                "date_to": " NONE ",
+                "section": "none",
                 "prefer_recent": "null",
                 "top_k": 5,
             },
@@ -342,6 +345,46 @@ class AgentToolsTests(unittest.TestCase):
             {"as_of": None, "date_from": None, "date_to": None, "section": None},
         )
         self.assertFalse(retriever.calls[0][1]["prefer_recent"])
+
+    def test_model_tool_output_removes_diagnostics_and_bounds_snippets(self):
+        snippet = "tipo de cambio " + ("texto " * 150)
+        output = {
+            "ok": True,
+            "data": {
+                "query": "tipo de cambio",
+                "strategy": "lexical",
+                "evidence": [
+                    {
+                        "chunk_id": 4,
+                        "document_id": 2,
+                        "path": "documento.md",
+                        "publication_date": "2025-01-01",
+                        "section": "MAT",
+                        "heading_path": ["Encabezado"],
+                        "score": 9.5,
+                        "source": "bm25_chunk",
+                        "rank": 1,
+                        "snippet": snippet,
+                        "snippet_truncated": False,
+                    }
+                ],
+                "versions": {"corpus_version": "test"},
+                "settings": {"bm25_depth": 100},
+            },
+        }
+
+        compact = _model_tool_output("search_evidence", output)
+
+        self.assertEqual(set(compact), {"ok", "evidence"})
+        candidate = compact["evidence"][0]
+        self.assertNotIn("path", candidate)
+        self.assertNotIn("score", candidate)
+        self.assertNotIn("source", candidate)
+        self.assertNotIn("publication_date", candidate)
+        self.assertNotIn("section", candidate)
+        self.assertLessEqual(len(candidate["snippet"]), 360)
+        self.assertTrue(candidate["snippet_truncated"])
+        self.assertEqual(output["data"]["evidence"][0]["snippet"], snippet)
 
     def test_recency_rerank_gives_recent_chunks_visibility_without_dominance(self):
         ranked = [10, 11, 12, 13, 14]
@@ -777,6 +820,23 @@ class AgentToolsTests(unittest.TestCase):
         self.assertEqual(run.answer.invalid_citations, [999])
         self.assertEqual(run.tool_calls, 3)
         self.assertEqual(run.stop_reason, "completed")
+        model_list_output = json.loads(
+            next(
+                item["output"]
+                for item in backend.calls[1]["input_items"]
+                if item.get("call_id") == "call-list"
+            )
+        )
+        self.assertEqual(set(model_list_output), {"ok", "publications"})
+        self.assertNotIn("path", model_list_output["publications"][0])
+        self.assertEqual(
+            run.traces[0].output["data"]["publications"][0]["path"],
+            "doc.md",
+        )
+        self.assertLess(
+            run.traces[0].model_output_bytes,
+            run.traces[0].full_output_bytes,
+        )
         self.assertEqual(backend.calls[-1]["tools"], [])
         self.assertEqual(
             {tool["name"] for tool in backend.calls[0]["tools"]},
@@ -1058,6 +1118,64 @@ class AgentToolsTests(unittest.TestCase):
         )
         self.assertEqual(answer.premise_status, "false")
         self.assertEqual(answer.citations, [4])
+
+    def test_false_premise_preserves_unclear_with_an_affirmative_correction(self):
+        answer = _parse_final_answer(
+            '{"answer":"No reformó el artículo 123; reformó los artículos 76 y 78 '
+            'de la Ley Federal del Trabajo.","citations":[4],'
+            '"premise_status":"unclear"}',
+            {4},
+        )
+        self.assertEqual(answer.premise_status, "unclear")
+
+    def test_unclear_with_a_plain_assertion_is_not_reclassified(self):
+        # Parsing preserves the reported status either way; a bare verb like
+        # "vigente" also does not trip the stricter review flag, which requires
+        # the answer to negate the premise and then correct it.
+        answer = _parse_final_answer(
+            '{"answer":"La ley vigente es aplicable.","citations":[4],'
+            '"premise_status":"unclear"}',
+            {4},
+        )
+        self.assertEqual(answer.premise_status, "unclear")
+
+    def test_verification_flags_only_explicit_corrections_left_unclear(self):
+        toolbox = SimpleNamespace(read_chunk_documents={}, missing_coverage=[])
+        explicit = AgentAnswer(
+            answer="No reformó el artículo 123; reformó los artículos 76 y 78.",
+            citations=[4],
+            invalid_citations=[],
+            premise_status="unclear",
+        )
+        self.assertTrue(
+            _verification(explicit, toolbox, 1)["premise_status_review_required"]
+        )
+        plain = AgentAnswer(
+            answer="La ley vigente es aplicable.",
+            citations=[4],
+            invalid_citations=[],
+            premise_status="unclear",
+        )
+        self.assertFalse(
+            _verification(plain, toolbox, 1)["premise_status_review_required"]
+        )
+        labeled = AgentAnswer(
+            answer=explicit.answer,
+            citations=[4],
+            invalid_citations=[],
+            premise_status="false",
+        )
+        self.assertFalse(
+            _verification(labeled, toolbox, 1)["premise_status_review_required"]
+        )
+
+    def test_false_premise_keeps_unclear_for_a_failed_search(self):
+        answer = _parse_final_answer(
+            '{"answer":"No se encontró el decreto en los chunks leídos.",'
+            '"citations":[4],"premise_status":"unclear"}',
+            {4},
+        )
+        self.assertEqual(answer.premise_status, "unclear")
 
     def test_agent_reports_missing_false_premise_correction(self):
         backend = ScriptedBackend(

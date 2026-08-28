@@ -224,6 +224,46 @@ class AgentResultTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["missing"], ["año 2025"])
         self.assertFalse(result["coverage"]["complete"])
         self.assertIn("invalid_citations_removed", result["warnings"])
+        self.assertNotIn("premise_status_review_required", result["warnings"])
+
+    def test_public_result_flags_a_premise_status_needing_review(self):
+        result = _public_result(
+            {
+                "answer": {
+                    "answer": "No reformó el artículo 123; reformó el 76.",
+                    "citations": [123],
+                    "invalid_citations": [],
+                    "premise_status": "unclear",
+                },
+                "traces": [
+                    {
+                        "name": "read_chunks",
+                        "output": {
+                            "ok": True,
+                            "data": {
+                                "chunks": [
+                                    {
+                                        "chunk_id": 123,
+                                        "document_id": 45,
+                                        "path": "2026/documento.md",
+                                        "text": "Pasaje verificable.",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                ],
+                "coverage": {},
+                "verification": {"premise_status_review_required": True},
+                "stop_reason": "completed",
+                "model_turns": 3,
+                "tool_calls": 1,
+                "usage": {"total_tokens": 100},
+                "elapsed_ms": 12.5,
+            }
+        )
+        self.assertEqual(result["answer"]["premise_status"], "unclear")
+        self.assertIn("premise_status_review_required", result["warnings"])
 
     def test_provenance_distinguishes_available_from_used_vector_index(self):
         with tempfile.TemporaryDirectory() as tempdir:
