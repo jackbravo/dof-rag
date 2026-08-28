@@ -105,29 +105,51 @@ def ingest_batch(conn: sqlite3.Connection, corpus: Path, batch: list[dict],
         for rec in batch:
             rel = rec["relpath"]
             exists = conn.execute(
-                "SELECT 1 FROM documents WHERE path = ?", (rel,)).fetchone()
-            if exists:
-                continue  # resume: already ingested
+                "SELECT d.document_id, d.byte_length,"
+                " EXISTS(SELECT 1 FROM document_segments AS s"
+                " WHERE s.document_id = d.document_id)"
+                " FROM documents AS d WHERE d.path = ?", (rel,)).fetchone()
+            if exists and (exists[1] <= segment_threshold or exists[2]):
+                continue  # resume: already ingested and structurally complete
             raw = (corpus / rel).read_bytes()
             digest = hashlib.sha256(raw).digest()
             size = len(raw)
             text = raw.decode("utf-8")
             if size > segment_threshold:
                 # metadata row with empty text; content lives in segments
-                cur = conn.execute(
-                    "INSERT INTO documents (path, source, year, publication_date, section,"
-                    " markdown, byte_length, sha256, corpus_version)"
-                    " VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
-                    (rel, source, rec["year"], rec["publication_date"], rec["section"],
-                     size, digest, corpus_version))
-                doc_id = cur.lastrowid
-                for i, start in enumerate(range(0, size, segment_threshold)):
+                if exists:
+                    doc_id = exists[0]
+                    conn.execute(
+                        "UPDATE documents SET source = ?, year = ?,"
+                        " publication_date = ?, section = ?, byte_length = ?,"
+                        " sha256 = ?, corpus_version = ?"
+                        " WHERE document_id = ?",
+                        (source, rec["year"], rec["publication_date"], rec["section"],
+                         size, digest, corpus_version, doc_id))
+                    conn.execute(
+                        "DELETE FROM document_segments WHERE document_id = ?", (doc_id,))
+                    print(f"  repairing incomplete oversized doc {doc_id}: {rel}",
+                          flush=True)
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO documents (path, source, year, publication_date, section,"
+                        " markdown, byte_length, sha256, corpus_version)"
+                        " VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
+                        (rel, source, rec["year"], rec["publication_date"], rec["section"],
+                         size, digest, corpus_version))
+                    doc_id = cur.lastrowid
+                for i, start in enumerate(range(0, len(text), segment_threshold)):
                     seg = text[start:start + segment_threshold]
                     conn.execute(
                         "INSERT INTO document_segments (document_id, segment_index,"
                         " start_offset, end_offset, segment_text) VALUES (?, ?, ?, ?, ?)",
                         (doc_id, i, start, start + len(seg), seg))
             else:
+                if exists:
+                    raise RuntimeError(
+                        f"document {rel} shrank below the segment threshold; refusing "
+                        "an implicit destructive rewrite"
+                    )
                 conn.execute(
                     "INSERT INTO documents (path, source, year, publication_date, section,"
                     " markdown, byte_length, sha256, corpus_version)"
@@ -239,7 +261,9 @@ def main() -> None:
     corpus = Path(args.corpus)
     db_path = Path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = [json.loads(l) for l in Path(args.manifest).read_text().splitlines()]
+    manifest = [
+        json.loads(line) for line in Path(args.manifest).read_text().splitlines()
+    ]
     if args.max_docs:
         manifest = manifest[: args.max_docs]
 

@@ -30,14 +30,18 @@ import argparse
 import hashlib
 import json
 import sqlite3
-import sys
 import time
 from pathlib import Path
 
-from rag_poc.chunker import (
-    BOILERPLATE_H, DocPattern, H2_RE, _count_tokens, _inline_image_descriptions,
-    split_text)
 from corpus_store.db import connect
+from rag_poc.chunker import (
+    BOILERPLATE_H,
+    H2_RE,
+    DocPattern,
+    _count_tokens,
+    _inline_image_descriptions,
+    split_text,
+)
 
 CHUNKER_VERSION = "dof-chunker-v1"  # rag_poc.chunker, MAX_TOKENS=800, OVERLAP=50
 
@@ -225,10 +229,11 @@ def reconstruct(recipe: list, c: str) -> str:
     return "".join(parts)
 
 
-def iter_documents(conn: sqlite3.Connection):
+def iter_documents(conn: sqlite3.Connection, after_document_id: int = 0):
     from corpus_store.db import fetch_document_text
     cur = conn.execute(
-        "SELECT document_id, path, markdown FROM documents ORDER BY document_id")
+        "SELECT document_id, path, markdown FROM documents"
+        " WHERE document_id > ? ORDER BY document_id", (after_document_id,))
     for doc_id, path, text in cur:
         if text:
             yield doc_id, path, text
@@ -255,11 +260,18 @@ def main() -> None:
         chunks.executescript(SCHEMA)
         chunks.commit()
 
+    # Both stores are append-only and each document is committed only after
+    # all of its chunks have been built. Avoid decompressing the full corpus
+    # on every daily incremental run.
+    last_document_id = chunks.execute(
+        "SELECT COALESCE(MAX(document_id), 0) FROM chunks"
+    ).fetchone()[0]
+
     t0 = time.time()
     n_docs = n_chunks = n_fallback = n_recipe_bytes = 0
     stats_by_pattern: dict[str, int] = {}
     batch: list[tuple] = []
-    for doc_id, path, raw in iter_documents(corpus):
+    for doc_id, path, raw in iter_documents(corpus, last_document_id):
         doc_t0 = time.time()
         done = chunks.execute(
             "SELECT 1 FROM chunks WHERE document_id = ? AND chunker_version = ?"

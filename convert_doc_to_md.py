@@ -27,7 +27,6 @@ import logging
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -80,6 +79,13 @@ def convert_single_doc(doc_path: Path, output_md_path: Path, worker_id: int = 0)
 
     if output_md_path.exists() and output_md_path.stat().st_size > 0:
         result["status"] = "skipped"
+        return result
+
+    with doc_path.open("rb") as stream:
+        prefix = stream.read(512).lstrip().lower()
+    if prefix.startswith((b"<!doctype html", b"<html")):
+        result["status"] = "invalid_download"
+        result["error"] = "HTML error page stored with a .doc extension"
         return result
 
     output_md_path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,7 +366,8 @@ def main():
             else:
                 failed += 1
                 failed_paths.append(result["doc_path"])
-                log.warning(f"FAILED [{status}]: {result['doc_path']}")
+                detail = f" — {result['error']}" if result.get("error") else ""
+                log.warning(f"FAILED [{status}]: {result['doc_path']}{detail}")
 
             if i % 1000 == 0 or i == len(work_items):
                 elapsed = time.time() - start_time
@@ -396,6 +403,8 @@ def main():
         if profile.exists():
             shutil.rmtree(profile, ignore_errors=True)
 
+    return 1 if failed_paths else 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

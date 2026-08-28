@@ -14,11 +14,11 @@ Simplified version - Only downloads WORD files
 
 """
 
+import logging
 import re
 import ssl
 import sys
 import time
-import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -35,6 +35,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Constants
 MIN_FILE_SIZE = 1024  # Minimum file size in bytes for validation
+ERROR_COUNT = 0
+HTML_PREFIXES = (b"<!doctype html", b"<html")
 
 
 class TLSAdapter(HTTPAdapter):
@@ -165,30 +167,41 @@ def _download_file(session: requests.Session, url: str, output_path: Path, file_
     Returns:
         True if download was successful, False otherwise
     """
+    global ERROR_COUNT
     try:
         logging.info(f"Downloading {file_type}: {url}")
         
         response = session.get(url, timeout=30)
         response.raise_for_status()
         
+        if not is_valid_word_payload(response.content):
+            logging.error(f"Invalid WORD payload returned by {url}")
+            if output_path.exists() and not is_valid_word_file(output_path):
+                output_path.unlink()
+            ERROR_COUNT += 1
+            return False
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(output_path, 'wb') as f:
+        temporary = output_path.with_suffix(output_path.suffix + ".part")
+        with open(temporary, 'wb') as f:
             f.write(response.content)
-        
-        if output_path.exists() and output_path.stat().st_size >= MIN_FILE_SIZE:
+        temporary.replace(output_path)
+
+        if is_valid_word_file(output_path):
             logging.info(f"Downloaded successfully: {output_path}")
             return True
         else:
             logging.warning(f"Invalid file (missing or too small), deleting: {output_path}")
             if output_path.exists():
                 output_path.unlink()
+            ERROR_COUNT += 1
             return False
             
     except Exception as e:
         logging.error(f"Error downloading {url}: {e}")
         if output_path.exists():
             output_path.unlink()
+        ERROR_COUNT += 1
         return False
 
 
@@ -205,6 +218,30 @@ def download_notice_file(session: requests.Session, note_id: str, output_path: P
     """
     url = f"https://sidof.segob.gob.mx/notas/getDoc/{note_id}"
     return _download_file(session, url, output_path, file_type="notice")
+
+
+def is_valid_word_payload(content: bytes) -> bool:
+    """Reject DOF/SIDOF HTML error pages masquerading as Word downloads."""
+    if len(content) < MIN_FILE_SIZE:
+        return False
+    prefix = content[:512].lstrip().lower()
+    return not prefix.startswith(HTML_PREFIXES)
+
+
+def is_valid_word_file(path: Path) -> bool:
+    try:
+        if path.stat().st_size < MIN_FILE_SIZE:
+            return False
+        with path.open("rb") as stream:
+            prefix = stream.read(512).lstrip().lower()
+        return not prefix.startswith(HTML_PREFIXES)
+    except OSError:
+        return False
+
+
+def has_valid_download(date_dir: Path, note_id: str) -> bool:
+    """Return whether this note exists under any page-order sequence number."""
+    return any(is_valid_word_file(path) for path in date_dir.glob(f"*_{note_id}.doc"))
 
 
 def _create_edition_dir(output_dir: Path, day: str, month: str, year: str, edition: str) -> Path:
@@ -259,8 +296,8 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
             filename = f"{str(index+1).zfill(3)}_AVISO_{year}{month}{day}_{edition}_{note_id}.doc"
             output_path = date_dir / filename
             
-            if output_path.exists() and output_path.stat().st_size >= MIN_FILE_SIZE:
-                logging.warning(f"File already exists: {output_path}")
+            if has_valid_download(date_dir, note_id):
+                logging.info(f"Notice already downloaded: {note_id}")
                 continue
             
             if download_notice_file(session, note_id, output_path):
@@ -271,6 +308,8 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
         return downloaded_count
         
     except Exception as e:
+        global ERROR_COUNT
+        ERROR_COUNT += 1
         logging.error(f"Error processing SIDOF page {sidof_url}: {e}")
         return 0
 
@@ -314,8 +353,8 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
             filename = f"{str(index+1).zfill(3)}_DOF_{year}{month}{day}_{edition}_{codnota}.doc"
             output_path = date_dir / filename
             
-            if output_path.exists() and output_path.stat().st_size >= MIN_FILE_SIZE:
-                logging.warning(f"File already exists: {output_path}")
+            if has_valid_download(date_dir, codnota):
+                logging.info(f"WORD note already downloaded: {codnota}")
                 continue
             
             if download_word_file(session, word_url, output_path):
@@ -330,6 +369,8 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
         return downloaded_count
         
     except Exception as e:
+        global ERROR_COUNT
+        ERROR_COUNT += 1
         logging.error(f"Error processing page {dof_url}: {e}")
         return 0
 
@@ -438,6 +479,9 @@ def main(
     
     logging.info("-" * 60)
     logging.info(f"Download completed. Total files downloaded: {total_downloaded}")
+    if ERROR_COUNT:
+        logging.error(f"Download completed with {ERROR_COUNT} error(s)")
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
