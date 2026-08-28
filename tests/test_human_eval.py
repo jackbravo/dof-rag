@@ -33,6 +33,7 @@ from human_eval.service import (
     EvaluationService,
     IdempotencyConflictError,
     PublicExecutionError,
+    QueueFullError,
 )
 from human_eval.store import SCHEMA_VERSION, EvaluationStore
 from scripts.seed_human_eval_v4_hybrid import SEED_USER, seed_live_run
@@ -933,6 +934,66 @@ class ServiceTests(unittest.TestCase):
             executor.release.set()
             service.close()
 
+    def test_queue_full_rejection_is_logged(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store, executor, executor.provenance, queue_capacity=1
+        )
+        service.start()
+        try:
+            service.submit(
+                RunRequest("primera", client_request_id="q1"),
+                user_id="u1",
+                admin=True,
+            )
+            self.assertTrue(executor.started.wait(timeout=3))
+            service.submit(
+                RunRequest("segunda", client_request_id="q2"),
+                user_id="u2",
+                admin=True,
+            )
+            with self.assertLogs("human_eval.service", level="WARNING") as captured:
+                with self.assertRaises(QueueFullError):
+                    service.submit(
+                        RunRequest("tercera", client_request_id="q3"),
+                        user_id="u3",
+                        admin=True,
+                    )
+            self.assertIn("queue full", captured.output[0])
+            self.assertIn("capacity=1", captured.output[0])
+        finally:
+            executor.release.set()
+            service.close()
+
+    def test_active_run_rejection_is_logged_without_user_id(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store, executor, executor.provenance, queue_capacity=2
+        )
+        service.start()
+        try:
+            service.submit(
+                RunRequest("primera", client_request_id="active-1"),
+                user_id="sensitive-user-id",
+                admin=True,
+            )
+            self.assertTrue(executor.started.wait(timeout=3))
+            with self.assertLogs("human_eval.service", level="WARNING") as captured:
+                with self.assertRaises(ActiveRunError):
+                    service.submit(
+                        RunRequest("segunda", client_request_id="active-2"),
+                        user_id="sensitive-user-id",
+                        admin=True,
+                    )
+            message = captured.output[0]
+            self.assertIn("active run exists", message)
+            self.assertIn("depth=0", message)
+            self.assertIn("capacity=2", message)
+            self.assertNotIn("sensitive-user-id", message)
+        finally:
+            executor.release.set()
+            service.close()
+
     def test_close_runs_the_executor_shutdown_hook(self):
         class ClosingExecutor(FakeExecutor):
             def __init__(self):
@@ -1302,6 +1363,15 @@ class AirAppTests(AirAppTestCase):
         feedback = self.service.store.feedback_for_run(run_id)
         self.assertEqual(feedback[0]["rating"], "partially_helpful")
         self.assertEqual(feedback[0]["user_id"], "alice")
+
+    def test_finished_run_splits_queue_wait_from_processing(self):
+        self.seed_and_unlock("alice")
+        run_id = self.create_run()
+        wait_for_terminal(self.service, run_id)
+        page = self.client.get(f"/runs/{run_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Espera en cola:", page.text)
+        self.assertIn("Procesamiento:", page.text)
 
     def test_progress_timeline_shows_decisions_and_expandable_chunks(self):
         rendered = _progress_timeline(
