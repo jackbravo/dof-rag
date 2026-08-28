@@ -19,8 +19,16 @@ if launchctl print "$domain/$label" >/dev/null 2>&1; then
     launchctl bootout "$domain/$label"
 fi
 
-install -m 0644 "$source_plist" "$target_plist"
-install -m 0755 "$source_runner" "$target_runner"
+# The checked-in plist and runner are templates: bake this account's paths in
+# at install time so the job works from any checkout, not just one developer's.
+sed -e "s|@DOF_RUNNER@|$target_runner|g" \
+    -e "s|@DOF_LOG_DIR@|$repo_dir/logs|g" \
+    "$source_plist" > "$target_plist"
+chmod 0644 "$target_plist"
+
+sed "s|^repo_dir=.*|repo_dir="$repo_dir"|" "$source_runner" > "$target_runner"
+chmod 0755 "$target_runner"
+
 launchctl bootstrap "$domain" "$target_plist"
 launchctl enable "$domain/$label"
 launchctl print "$domain/$label"

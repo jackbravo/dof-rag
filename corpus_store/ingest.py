@@ -105,12 +105,10 @@ def ingest_batch(conn: sqlite3.Connection, corpus: Path, batch: list[dict],
         for rec in batch:
             rel = rec["relpath"]
             exists = conn.execute(
-                "SELECT d.document_id, d.byte_length,"
-                " EXISTS(SELECT 1 FROM document_segments AS s"
-                " WHERE s.document_id = d.document_id)"
+                "SELECT d.document_id, d.byte_length"
                 " FROM documents AS d WHERE d.path = ?", (rel,)).fetchone()
-            if exists and (exists[1] <= segment_threshold or exists[2]):
-                continue  # resume: already ingested and structurally complete
+            if exists and exists[1] <= segment_threshold:
+                continue  # resume: small document already ingested
             raw = (corpus / rel).read_bytes()
             digest = hashlib.sha256(raw).digest()
             size = len(raw)
@@ -119,6 +117,16 @@ def ingest_batch(conn: sqlite3.Connection, corpus: Path, batch: list[dict],
                 # metadata row with empty text; content lives in segments
                 if exists:
                     doc_id = exists[0]
+                    # EXISTS alone is not enough: an interrupted import can
+                    # leave only a subset of the expected segments. Compare
+                    # count and total length against the source file.
+                    coverage = conn.execute(
+                        "SELECT COUNT(*), COALESCE(SUM(LENGTH(segment_text)), 0)"
+                        " FROM document_segments WHERE document_id = ?",
+                        (doc_id,)).fetchone()
+                    expected = -(-len(text) // segment_threshold)
+                    if tuple(coverage) == (expected, len(text)):
+                        continue  # resume: oversized doc structurally complete
                     conn.execute(
                         "UPDATE documents SET source = ?, year = ?,"
                         " publication_date = ?, section = ?, byte_length = ?,"

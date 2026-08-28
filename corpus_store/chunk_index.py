@@ -262,9 +262,12 @@ def main() -> None:
 
     # Both stores are append-only and each document is committed only after
     # all of its chunks have been built. Avoid decompressing the full corpus
-    # on every daily incremental run.
+    # on every daily incremental run. The checkpoint is keyed by chunker
+    # version so bumping CHUNKER_VERSION re-chunks the full corpus instead
+    # of silently skipping every previously chunked document.
     last_document_id = chunks.execute(
         "SELECT COALESCE(MAX(document_id), 0) FROM chunks"
+        " WHERE chunker_version = ?", (CHUNKER_VERSION,)
     ).fetchone()[0]
 
     t0 = time.time()

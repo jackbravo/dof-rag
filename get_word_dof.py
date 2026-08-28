@@ -338,30 +338,32 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
         response.raise_for_status()
         
         word_links = extract_word_links(response.text)
-        
-        if not word_links:
-            logging.info(f"No WORD files found for {date_str} - {edition}")
-            return 0
-        
-        logging.info(f"Found {len(word_links)} WORD files")
-        
-        date_dir = _create_edition_dir(output_dir, day, month, year, edition)
-        
         downloaded_count = 0
-        
-        for index, (word_url, codnota) in enumerate(word_links):
-            filename = f"{str(index+1).zfill(3)}_DOF_{year}{month}{day}_{edition}_{codnota}.doc"
-            output_path = date_dir / filename
-            
-            if has_valid_download(date_dir, codnota):
-                logging.info(f"WORD note already downloaded: {codnota}")
-                continue
-            
-            if download_word_file(session, word_url, output_path):
-                downloaded_count += 1
-            
-            time.sleep(sleep_delay)
-        
+
+        if not word_links:
+            # No Word documents on the main page does not imply the edition
+            # is empty: SIDOF notices may still exist for this date.
+            logging.info(
+                f"No WORD files found for {date_str} - {edition}; "
+                "still checking SIDOF notices")
+        else:
+            logging.info(f"Found {len(word_links)} WORD files")
+
+            date_dir = _create_edition_dir(output_dir, day, month, year, edition)
+
+            for index, (word_url, codnota) in enumerate(word_links):
+                filename = f"{str(index+1).zfill(3)}_DOF_{year}{month}{day}_{edition}_{codnota}.doc"
+                output_path = date_dir / filename
+
+                if has_valid_download(date_dir, codnota):
+                    logging.info(f"WORD note already downloaded: {codnota}")
+                    continue
+
+                if download_word_file(session, word_url, output_path):
+                    downloaded_count += 1
+
+                time.sleep(sleep_delay)
+
         logging.info(f"Now processing SIDOF notices for {date_str} - {edition}")
         notices_downloaded = process_sidof_notices(session, day, month, year, edition, output_dir, sleep_delay, start_index=len(word_links))
         downloaded_count += notices_downloaded

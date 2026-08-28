@@ -166,14 +166,17 @@ def preflight(args: argparse.Namespace) -> None:
         args.chunks_db,
         args.vectors_db,
         args.vec0_db,
-        args.gguf,
     ]
+    executables = ["soffice", "pandoc"]
+    if not args.skip_embeddings:
+        required_files.append(args.gguf)
+        executables.append("llama-server")
     missing = [str(path) for path in required_files if not path.is_file()]
     if missing:
         raise RuntimeError("missing required file(s): " + ", ".join(missing))
     if not args.corpus.is_dir():
         raise RuntimeError(f"canonical corpus directory not found: {args.corpus}")
-    for executable in ("soffice", "pandoc", "llama-server"):
+    for executable in executables:
         if not shutil.which(executable, path=command_environment()["PATH"]):
             raise RuntimeError(f"required executable not found: {executable}")
     free_gib = shutil.disk_usage(args.corpus).free / 2**30
@@ -273,6 +276,13 @@ def main() -> int:
     args.chunks_db = args.db_dir / "dof_chunks.sqlite"
     args.vectors_db = args.db_dir / "dof_vectors_jina_binary.sqlite"
     args.vec0_db = args.db_dir / "dof_vec0_jina_binary.sqlite"
+
+    if not args.corpus_db.is_file():
+        raise SystemExit(
+            f"corpus database not found: {args.corpus_db}\n"
+            "run the full corpus build first (docs/full-corpus-build.md), "
+            "or pass --db-dir"
+        )
 
     last_publication = latest_publication(args.corpus_db)
     watermark = completed_through(

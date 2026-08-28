@@ -84,8 +84,17 @@ def convert_single_doc(doc_path: Path, output_md_path: Path, worker_id: int = 0)
     with doc_path.open("rb") as stream:
         prefix = stream.read(512).lstrip().lower()
     if prefix.startswith((b"<!doctype html", b"<html")):
+        # Quarantine so this run's failure does not repeat forever: the
+        # .invalid suffix is invisible to the *.doc scan here and to the
+        # *_<note_id>.doc resume glob in get_word_dof, so the downloader
+        # re-fetches the notice on its next pass.
+        quarantine = doc_path.with_name(doc_path.name + ".invalid")
+        doc_path.replace(quarantine)
         result["status"] = "invalid_download"
-        result["error"] = "HTML error page stored with a .doc extension"
+        result["error"] = (
+            "HTML error page stored with a .doc extension; "
+            f"quarantined to {quarantine.name}"
+        )
         return result
 
     output_md_path.parent.mkdir(parents=True, exist_ok=True)

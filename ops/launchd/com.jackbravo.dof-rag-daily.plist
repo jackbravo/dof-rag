@@ -12,7 +12,7 @@
         <string>10</string>
         <string>/usr/bin/caffeinate</string>
         <string>-i</string>
-        <string>/Users/jackbravo/Library/Application Support/DOF-RAG/run_dof_daily.sh</string>
+        <string>@DOF_RUNNER@</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -30,8 +30,8 @@
     <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/jackbravo/Documents/jackbravo/dof-rag/logs/dof-daily.log</string>
+    <string>@DOF_LOG_DIR@/dof-daily.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/jackbravo/Documents/jackbravo/dof-rag/logs/dof-daily.error.log</string>
+    <string>@DOF_LOG_DIR@/dof-daily.error.log</string>
 </dict>
 </plist>

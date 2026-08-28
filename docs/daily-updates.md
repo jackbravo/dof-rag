@@ -17,9 +17,14 @@ native macOS scheduler and runs a missed calendar job after the Mac wakes.
 6. Verify that document, FTS, chunk, embedding, and vec0 coverage agree.
 
 Downloads are content-checked: an HTML error page returned under a `.doc`
-filename is rejected and retried on the next run. Conversion failures also
+filename is rejected and retried on the next run. The converter applies the
+same check and quarantines such files to `<name>.doc.invalid`, which is
+invisible to both the `*.doc` conversion scan and the downloader's resume
+glob, so a stale error page can never block the watermark forever.
+Conversion failures also
 keep the contiguous completion watermark unchanged while successfully
-converted documents continue through the indexes.
+converted documents continue through the indexes. When a DOF listing page
+has no Word links, SIDOF notices for that date are still checked.
 
 The updater uses a non-blocking lock, so a scheduled run exits harmlessly if a
 catch-up is still running. It keeps raw Word files for auditability and because
@@ -89,6 +94,8 @@ launchctl bootout gui/$(id -u)/com.jackbravo.dof-rag-daily
 
 The checked-in plist is at
 `ops/launchd/com.jackbravo.dof-rag-daily.plist`; the installed copy is
-`~/Library/LaunchAgents/com.jackbravo.dof-rag-daily.plist`. The installer also
-copies the tiny shell launcher to `~/Library/Application Support/DOF-RAG/` so
-macOS can open it outside the protected Documents folder.
+`~/Library/LaunchAgents/com.jackbravo.dof-rag-daily.plist`. Both the plist
+and the tiny shell launcher under
+`~/Library/Application Support/DOF-RAG/` are templates: the installer bakes
+in this checkout's absolute paths, so the job works from any clone and any
+account. Re-run the installer after moving the repository.

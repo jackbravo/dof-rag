@@ -134,8 +134,13 @@ def main() -> None:
     n = conn.execute(
         "SELECT COUNT(*) FROM documents_fts"
         " WHERE documents_fts MATCH 'decreto'").fetchone()[0]
-    expected_min = min(10_000, max(total - 1, 0))
-    assert n > expected_min, f"suspiciously few MATCH results: {n}"
+    if total > 10_000:
+        assert n > 10_000, f"suspiciously few MATCH results: {n}"
+    else:
+        # Small test/incremental corpora are guarded by the exact count
+        # equality above; 'decreto' frequency is unrepresentative there.
+        print(f"small corpus ({total:,} docs): {n:,} 'decreto' matches "
+              "(MATCH threshold only applies above 10,000 docs)", flush=True)
     set_meta(conn, "complete", 1)
     conn.commit()
     print(f"FTS5 build complete: {done:,} docs in "
