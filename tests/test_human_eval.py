@@ -224,17 +224,16 @@ class AgentResultTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["missing"], ["año 2025"])
         self.assertFalse(result["coverage"]["complete"])
         self.assertIn("invalid_citations_removed", result["warnings"])
-        self.assertNotIn("premise_status_normalized", result["warnings"])
+        self.assertNotIn("premise_status_review_required", result["warnings"])
 
-    def test_public_result_flags_a_normalized_premise_status(self):
+    def test_public_result_flags_a_premise_status_needing_review(self):
         result = _public_result(
             {
                 "answer": {
                     "answer": "No reformó el artículo 123; reformó el 76.",
                     "citations": [123],
                     "invalid_citations": [],
-                    "premise_status": "false",
-                    "premise_status_reported": "unclear",
+                    "premise_status": "unclear",
                 },
                 "traces": [
                     {
@@ -255,7 +254,7 @@ class AgentResultTests(unittest.TestCase):
                     },
                 ],
                 "coverage": {},
-                "verification": {},
+                "verification": {"premise_status_review_required": True},
                 "stop_reason": "completed",
                 "model_turns": 3,
                 "tool_calls": 1,
@@ -263,9 +262,8 @@ class AgentResultTests(unittest.TestCase):
                 "elapsed_ms": 12.5,
             }
         )
-        self.assertEqual(result["answer"]["premise_status"], "false")
-        self.assertIn("premise_status_normalized", result["warnings"])
-        self.assertNotIn("premise_status_reported", result["answer"])
+        self.assertEqual(result["answer"]["premise_status"], "unclear")
+        self.assertIn("premise_status_review_required", result["warnings"])
 
     def test_provenance_distinguishes_available_from_used_vector_index(self):
         with tempfile.TemporaryDirectory() as tempdir:

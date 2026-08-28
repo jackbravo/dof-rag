@@ -401,9 +401,8 @@ def _public_result(run: dict[str, Any]) -> dict[str, Any]:
         warnings.append("coverage_incomplete")
     if run["answer"].get("invalid_citations"):
         warnings.append("invalid_citations_removed")
-    premise_reported = run["answer"].get("premise_status_reported")
-    if premise_reported and premise_reported != run["answer"].get("premise_status"):
-        warnings.append("premise_status_normalized")
+    if run.get("verification", {}).get("premise_status_review_required"):
+        warnings.append("premise_status_review_required")
     if run["stop_reason"] != "completed":
         warnings.append(run["stop_reason"])
     return {

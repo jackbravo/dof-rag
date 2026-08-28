@@ -1117,26 +1117,24 @@ class AgentToolsTests(unittest.TestCase):
         self.assertEqual(answer.premise_status, "false")
         self.assertEqual(answer.citations, [4])
 
-    def test_false_premise_normalizes_unclear_with_an_affirmative_correction(self):
+    def test_false_premise_preserves_unclear_with_an_affirmative_correction(self):
         answer = _parse_final_answer(
             '{"answer":"No reformó el artículo 123; reformó los artículos 76 y 78 '
             'de la Ley Federal del Trabajo.","citations":[4],'
             '"premise_status":"unclear"}',
             {4},
         )
-        self.assertEqual(answer.premise_status, "false")
-        self.assertEqual(answer.to_dict()["premise_status_reported"], "unclear")
+        self.assertEqual(answer.premise_status, "unclear")
 
     def test_unclear_with_a_plain_assertion_is_not_reclassified(self):
         # A bare verb like "vigente" validates an already-false premise, but is
-        # not enough to infer one: the answer must negate and then correct.
+        # not enough to request review: the answer must negate and then correct.
         answer = _parse_final_answer(
             '{"answer":"La ley vigente es aplicable.","citations":[4],'
             '"premise_status":"unclear"}',
             {4},
         )
         self.assertEqual(answer.premise_status, "unclear")
-        self.assertEqual(answer.to_dict()["premise_status_reported"], "unclear")
 
     def test_false_premise_keeps_unclear_for_a_failed_search(self):
         answer = _parse_final_answer(

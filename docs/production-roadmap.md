@@ -83,10 +83,11 @@ Es una medición de una sola pregunta y Qwen puede variar entre corridas, así q
 la tomamos como señal prometedora, no como cifra definitiva de capacidad.
 
 Después corrimos una pregunta de cada una de las siete categorías de eval-v4.
-Las siete terminaron con la evidencia esperada después de corregir dos
-incompatibilidades observadas en Qwen: también puede escribir `"None"` para un
-valor nulo y a veces marca como `unclear` una respuesta que ya contiene una
-corrección afirmativa de la premisa. La recuperación de citas fue completa y la
+Las siete localizaron la evidencia esperada después de aceptar que Qwen también
+puede escribir `"None"` para un valor nulo. En el caso de premisa falsa, el
+modelo dejó el estado en `unclear` aunque el texto contenía una corrección
+afirmativa; conservamos ese estado y marcamos la respuesta para revisión, en vez
+de cambiarlo con una heurística. La recuperación de citas fue completa y la
 precisión automática fue 0.86 por dos citas adicionales. El tiempo varió de 244
 a 1,136 segundos, con un promedio de 458; la cola larga importa mucho más que
 el promedio para decidir la capacidad inicial.
