@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from agent_tools.agent import (
     FINAL_ANSWER_SCHEMA,
+    AgentAnswer,
     AgentRunner,
     DofToolbox,
     ModelTurn,
@@ -17,6 +18,7 @@ from agent_tools.agent import (
     _model_tool_output,
     _parse_final_answer,
     _query_snippet,
+    _verification,
 )
 from agent_tools.headers import extract_document_header
 from agent_tools.llm import _parse_json, answer_with_context
@@ -1127,14 +1129,45 @@ class AgentToolsTests(unittest.TestCase):
         self.assertEqual(answer.premise_status, "unclear")
 
     def test_unclear_with_a_plain_assertion_is_not_reclassified(self):
-        # A bare verb like "vigente" validates an already-false premise, but is
-        # not enough to request review: the answer must negate and then correct.
+        # Parsing preserves the reported status either way; a bare verb like
+        # "vigente" also does not trip the stricter review flag, which requires
+        # the answer to negate the premise and then correct it.
         answer = _parse_final_answer(
             '{"answer":"La ley vigente es aplicable.","citations":[4],'
             '"premise_status":"unclear"}',
             {4},
         )
         self.assertEqual(answer.premise_status, "unclear")
+
+    def test_verification_flags_only_explicit_corrections_left_unclear(self):
+        toolbox = SimpleNamespace(read_chunk_documents={}, missing_coverage=[])
+        explicit = AgentAnswer(
+            answer="No reformó el artículo 123; reformó los artículos 76 y 78.",
+            citations=[4],
+            invalid_citations=[],
+            premise_status="unclear",
+        )
+        self.assertTrue(
+            _verification(explicit, toolbox, 1)["premise_status_review_required"]
+        )
+        plain = AgentAnswer(
+            answer="La ley vigente es aplicable.",
+            citations=[4],
+            invalid_citations=[],
+            premise_status="unclear",
+        )
+        self.assertFalse(
+            _verification(plain, toolbox, 1)["premise_status_review_required"]
+        )
+        labeled = AgentAnswer(
+            answer=explicit.answer,
+            citations=[4],
+            invalid_citations=[],
+            premise_status="false",
+        )
+        self.assertFalse(
+            _verification(labeled, toolbox, 1)["premise_status_review_required"]
+        )
 
     def test_false_premise_keeps_unclear_for_a_failed_search(self):
         answer = _parse_final_answer(
