@@ -34,6 +34,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 
+from word_validation import is_valid_word_file
+
 # Configuration
 PANDOC_FILTER = Path(__file__).parent / "pandoc_filters" / "dof_headers.lua"
 LOG_FILE = Path(__file__).parent / "convert_doc_to_md.log"
@@ -83,9 +85,7 @@ def convert_single_doc(doc_path: Path, output_md_path: Path, worker_id: int = 0)
         result["status"] = "skipped"
         return result
 
-    with doc_path.open("rb") as stream:
-        prefix = stream.read(512).lstrip().lower()
-    if prefix.startswith((b"<!doctype html", b"<html")):
+    if not is_valid_word_file(doc_path):
         # Quarantine so this run's failure does not repeat forever: the
         # .invalid suffix is invisible to the *.doc scan here and to the
         # *_<note_id>.doc resume glob in get_word_dof, so the downloader
@@ -94,7 +94,7 @@ def convert_single_doc(doc_path: Path, output_md_path: Path, worker_id: int = 0)
         doc_path.replace(quarantine)
         result["status"] = "invalid_download"
         result["error"] = (
-            "HTML error page stored with a .doc extension; "
+            "invalid Word payload stored with a .doc extension; "
             f"quarantined to {quarantine.name}"
         )
         return result

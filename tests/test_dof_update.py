@@ -23,7 +23,11 @@ from corpus_store.embed import (
     apply_chunk_vector_invalidations,
 )
 from corpus_store.ingest import SCHEMA, ingest_batch
-from get_word_dof import has_valid_download, is_valid_word_payload
+from get_word_dof import (
+    has_valid_download,
+    is_valid_sidof_listing,
+    is_valid_word_payload,
+)
 from rag_poc.chunker import DocPattern
 from scripts.build_fts_full import FTS_DDL, repair_fts_documents
 from scripts.build_vec0_full import (
@@ -86,6 +90,27 @@ class DailyUpdateTests(unittest.TestCase):
     def test_html_error_page_is_not_a_word_download(self):
         payload = b"<!DOCTYPE html><title>500 error</title>" + b"x" * 1024
         self.assertFalse(is_valid_word_payload(payload))
+
+    def test_only_known_word_signatures_are_valid(self):
+        self.assertTrue(
+            is_valid_word_payload(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"x" * 1024)
+        )
+        self.assertTrue(is_valid_word_payload(b"PK\x03\x04" + b"x" * 1024))
+        self.assertFalse(
+            is_valid_word_payload(b"\xef\xbb\xbf{\"error\":true}" + b"x" * 1024)
+        )
+
+    def test_sidof_listing_requires_requested_edition_tab(self):
+        html = (
+            "<html><head><title>Diario Oficial de la Federación</title></head>"
+            "<body><div id='resp-tab3'>26-08-2026</div></body></html>"
+        )
+        self.assertTrue(
+            is_valid_sidof_listing(html, "26", "08", "2026", "MAT")
+        )
+        self.assertFalse(
+            is_valid_sidof_listing(html, "26", "08", "2026", "VES")
+        )
 
     def test_conversion_scan_is_limited_to_active_date_window(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -341,10 +366,24 @@ class DailyUpdateTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "invalid_download")
             self.assertFalse(doc.exists())
-            self.assertTrue((root / "001_DOF_20260826_MAT_12345.doc.invalid").exists())
+            self.assertTrue(
+                (root / "001_DOF_20260826_MAT_12345.doc.invalid").exists()
+            )
             # The quarantined file is invisible to the downloader's resume
             # glob, so the notice is re-fetched on the next download pass.
             self.assertFalse(has_valid_download(root, "12345"))
+
+    def test_non_word_error_body_is_quarantined_for_redownload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            doc = root / "001_DOF_20260826_MAT_12345.doc"
+            doc.write_bytes(b"\xef\xbb\xbf{\"error\":true}" + b"x" * 1024)
+
+            result = convert_single_doc(doc, root / "001_DOF_20260826_MAT_12345.md")
+
+            self.assertEqual(result["status"], "invalid_download")
+            self.assertFalse(doc.exists())
+            self.assertTrue((root / "001_DOF_20260826_MAT_12345.doc.invalid").exists())
 
     def test_sidof_notices_checked_when_page_has_no_word_links(self):
         session = mock.Mock()

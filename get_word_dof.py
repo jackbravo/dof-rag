@@ -30,13 +30,13 @@ import urllib3
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 
+from word_validation import is_valid_word_file, is_valid_word_payload
+
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Constants
-MIN_FILE_SIZE = 1024  # Minimum file size in bytes for validation
 ERROR_COUNT = 0
-HTML_PREFIXES = (b"<!doctype html", b"<html")
 
 
 class TLSAdapter(HTTPAdapter):
@@ -177,7 +177,7 @@ def is_valid_dof_listing(
 
 
 def is_valid_sidof_listing(
-    html_content: str, day: str, month: str, year: str
+    html_content: str, day: str, month: str, year: str, edition: str
 ) -> bool:
     """Require the dated SIDOF publication shell before accepting no notices."""
     soup = BeautifulSoup(html_content, "html.parser")
@@ -186,7 +186,8 @@ def is_valid_sidof_listing(
         return False
     if f"{day}-{month}-{year}" not in html_content:
         return False
-    return soup.find(id="resp-tab2") is not None or soup.find(id="resp-tab3") is not None
+    expected_tab = {"VES": "resp-tab2", "MAT": "resp-tab3"}.get(edition)
+    return expected_tab is not None and soup.find(id=expected_tab) is not None
 
 
 def _download_file(session: requests.Session, url: str, output_path: Path, file_type: str = "file") -> bool:
@@ -255,25 +256,6 @@ def download_notice_file(session: requests.Session, note_id: str, output_path: P
     return _download_file(session, url, output_path, file_type="notice")
 
 
-def is_valid_word_payload(content: bytes) -> bool:
-    """Reject DOF/SIDOF HTML error pages masquerading as Word downloads."""
-    if len(content) < MIN_FILE_SIZE:
-        return False
-    prefix = content[:512].lstrip().lower()
-    return not prefix.startswith(HTML_PREFIXES)
-
-
-def is_valid_word_file(path: Path) -> bool:
-    try:
-        if path.stat().st_size < MIN_FILE_SIZE:
-            return False
-        with path.open("rb") as stream:
-            prefix = stream.read(512).lstrip().lower()
-        return not prefix.startswith(HTML_PREFIXES)
-    except OSError:
-        return False
-
-
 def has_valid_download(date_dir: Path, note_id: str) -> bool:
     """Return whether this note exists under any page-order sequence number."""
     return any(is_valid_word_file(path) for path in date_dir.glob(f"*_{note_id}.doc"))
@@ -310,7 +292,7 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
         response = session.get(sidof_url, timeout=30)
         response.raise_for_status()
 
-        if not is_valid_sidof_listing(response.text, day, month, year):
+        if not is_valid_sidof_listing(response.text, day, month, year, edition):
             ERROR_COUNT += 1
             logging.error(
                 f"SIDOF returned an unrecognized listing for "
