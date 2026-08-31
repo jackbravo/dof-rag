@@ -270,6 +270,8 @@ class AgentExecutorConfigTests(unittest.TestCase):
             Path("~/dof-gguf/jina-v5-small-retrieval-F16.gguf").expanduser(),
         )
         self.assertEqual(config.embed_port, 8086)
+        self.assertEqual(config.model_concurrency, 1)
+        self.assertTrue(config.manage_embed_server)
 
     def test_lexical_mode_does_not_default_to_vector_database(self):
         vec0_dir = self.root.resolve() / "dof_db"
@@ -339,6 +341,13 @@ class AgentExecutorConfigTests(unittest.TestCase):
             DOF_AGENT_PROVIDER="llama-server", DOF_REASONING_EFFORT=""
         )
         self.assertIsNone(config.reasoning_effort)
+
+    def test_accepts_shared_model_and_external_embedding_server(self):
+        config = self._config(
+            DOF_MODEL_CONCURRENCY="4", DOF_MANAGE_EMBED_SERVER="false"
+        )
+        self.assertEqual(config.model_concurrency, 4)
+        self.assertFalse(config.manage_embed_server)
 
     def test_non_lexical_mode_requires_existing_vector_index(self):
         with self.assertRaisesRegex(ValueError, "vector index"):
@@ -935,6 +944,50 @@ class ServiceTests(unittest.TestCase):
         finally:
             executor.release.set()
             service.close()
+
+    def test_two_services_share_one_sqlite_model_slot(self):
+        first_executor = BlockingExecutor()
+        second_executor = BlockingExecutor()
+        first_service = EvaluationService(
+            self.store,
+            first_executor,
+            first_executor.provenance,
+            model_concurrency=1,
+            lease_seconds=1,
+        )
+        second_service = EvaluationService(
+            self.store,
+            second_executor,
+            second_executor.provenance,
+            model_concurrency=1,
+            lease_seconds=1,
+        )
+        first_service.start()
+        second_service.start()
+        try:
+            first = first_service.submit(
+                RunRequest("primera", client_request_id="shared-1"),
+                user_id="shared-u1",
+                admin=True,
+            )
+            self.assertTrue(first_executor.started.wait(timeout=1))
+            second = second_service.submit(
+                RunRequest("segunda", client_request_id="shared-2"),
+                user_id="shared-u2",
+                admin=True,
+            )
+            time.sleep(0.3)
+            self.assertEqual(self.store.model_activity(1)["active"], 1)
+            self.assertEqual(self.store.get_run(second["run_id"])["status"], "queued")
+            first_executor.release.set()
+            second_executor.release.set()
+            wait_for_terminal(first_service, first["run_id"])
+            wait_for_terminal(first_service, second["run_id"])
+        finally:
+            first_executor.release.set()
+            second_executor.release.set()
+            first_service.close()
+            second_service.close()
 
     def test_close_runs_the_executor_shutdown_hook(self):
         class ClosingExecutor(FakeExecutor):
@@ -1815,7 +1868,7 @@ class QueueAdmissionTests(AirAppTestCase):
             self.as_user("u3", admin=True)
             response = self.post_run("pregunta tres")
             self.assertEqual(response.status_code, 503)
-            self.assertIn("La cola local está llena", response.text)
+            self.assertIn("La cola de preguntas está llena", response.text)
             retry_after = int(response.headers["Retry-After"])
             self.assertGreaterEqual(retry_after, 60)
         finally:

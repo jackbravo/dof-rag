@@ -1,4 +1,4 @@
-"""Single-process Air application for controlled human evaluation of the DOF agent.
+"""Air application for controlled human evaluation of the DOF agent.
 
 Authentication is provider-agnostic: ``create_app`` receives an
 ``auth.AuthBackend`` and never imports a provider. Production wires Clerk via
@@ -98,6 +98,9 @@ class WebSettings:
     session_max_age: int = 12 * 60 * 60
     daily_question_limit: int = 1
     queue_capacity: int = 20
+    model_concurrency: int = 1
+    scheduler_workers: int | None = None
+    model_lease_seconds: float = 120.0
 
     @classmethod
     def from_env(cls, repo_root: Path) -> "WebSettings":
@@ -128,6 +131,15 @@ class WebSettings:
             ),
             daily_question_limit=int(os.environ.get("DOF_DAILY_QUESTION_LIMIT", "1")),
             queue_capacity=int(os.environ.get("DOF_QUEUE_CAPACITY", "20")),
+            model_concurrency=int(os.environ.get("DOF_MODEL_CONCURRENCY", "1")),
+            scheduler_workers=(
+                int(os.environ["DOF_SCHEDULER_WORKERS"])
+                if os.environ.get("DOF_SCHEDULER_WORKERS")
+                else None
+            ),
+            model_lease_seconds=float(
+                os.environ.get("DOF_MODEL_LEASE_SECONDS", "120")
+            ),
         )
 
 
@@ -457,6 +469,12 @@ STREAM_SCRIPT = """
       appendProgress(list, event);
       state.textContent = 'Recibiendo actividad en vivo';
     });
+    source.addEventListener('queue', (message) => {
+      const event = JSON.parse(message.data);
+      const queueStatus = node.querySelector('[data-queue-status]');
+      if (queueStatus) queueStatus.textContent = event.message || 'Actualizando la cola…';
+      state.textContent = 'Esperando capacidad del modelo';
+    });
     source.addEventListener('terminal', async () => {
       source.close();
       state.textContent = 'Preparando el resultado…';
@@ -650,9 +668,18 @@ def _status_fragment(
                 if wait
                 else ""
             )
+            snapshot = run.get("queue_snapshot", {})
+            active = snapshot.get("active")
+            capacity = snapshot.get("capacity")
+            capacity_text = (
+                f" · {active} de {capacity} slots ocupados"
+                if active is not None and capacity is not None
+                else ""
+            )
             queue_note = (
-                f'<p class="meta">Posición en la cola: '
-                f'{_escape(run["queue_position"])}{_escape(wait_text)}</p>'
+                f'<p class="meta" data-queue-status>Posición en la cola: '
+                f'{_escape(run["queue_position"])}{_escape(wait_text)}'
+                f'{_escape(capacity_text)}</p>'
             )
         return f"""<section id="run-status" class="panel status" data-state="{state}"
 data-stream-url="/runs/{_escape(run["run_id"])}/events"
@@ -1262,7 +1289,7 @@ def create_app(
             return render_home(
                 request,
                 user,
-                error="La cola local está llena; intenta más tarde.",
+                error="La cola de preguntas está llena; intenta más tarde.",
                 values=values,
                 status_code=503,
                 headers={"Retry-After": str(service.queue_retry_after())},
@@ -1409,6 +1436,7 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
         async def event_stream() -> AsyncIterator[str]:
             cursor = after
             heartbeat_at = time.monotonic()
+            last_queue_state: tuple[int, int, int] | None = None
             while True:
                 events = await asyncio.to_thread(
                     service.store.progress_for_run, run_id, after=cursor
@@ -1422,6 +1450,25 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
                 run = await asyncio.to_thread(
                     service.public_run, run_id, user_id=user.id, admin=True
                 )
+                if run["status"] == "queued":
+                    snapshot = run.get("queue_snapshot", {})
+                    queue_state = (
+                        int(run.get("queue_position") or 0),
+                        int(snapshot.get("active") or 0),
+                        int(snapshot.get("capacity") or 0),
+                    )
+                    if queue_state != last_queue_state:
+                        last_queue_state = queue_state
+                        message = (
+                            f"Posición en la cola: {queue_state[0]} · "
+                            f"Espera aproximada: "
+                            f"{max(1, round((run.get('estimated_wait_seconds') or 60) / 60))} min · "
+                            f"{queue_state[1]} de {queue_state[2]} slots ocupados"
+                        )
+                        yield (
+                            "event: queue\n"
+                            f"data: {json.dumps({'message': message}, ensure_ascii=False)}\n\n"
+                        )
                 if run["status"] not in ACTIVE_STATES:
                     data = json.dumps({"status": run["status"]}, separators=(",", ":"))
                     yield f"event: terminal\ndata: {data}\n\n"
@@ -1579,6 +1626,8 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
                     "required_hops": 5,
                     "questions_per_day": settings.daily_question_limit,
                     "active_runs_per_user": 1,
+                    "model_concurrency": settings.model_concurrency,
+                    "queue_capacity": settings.queue_capacity,
                 },
             }
         )
@@ -1618,12 +1667,16 @@ def build_default_app(repo_root: Path | None = None) -> tuple[Any, WebSettings]:
     from .clerk_auth import ClerkAuthBackend, clerk_login_scripts, clerk_page_scripts
 
     auth_backend = ClerkAuthBackend(secret_key=airclerk.settings.CLERK_SECRET_KEY)
-    executor = AgentRunExecutor(AgentExecutorConfig.from_env(root))
+    executor_config = AgentExecutorConfig.from_env(root)
+    executor = AgentRunExecutor(executor_config)
     service = EvaluationService(
         EvaluationStore(settings.db_path),
         executor,
         executor.provenance,
         queue_capacity=settings.queue_capacity,
+        model_concurrency=executor_config.model_concurrency,
+        scheduler_workers=settings.scheduler_workers,
+        lease_seconds=settings.model_lease_seconds,
     )
     app = create_app(
         service,
@@ -1637,12 +1690,42 @@ def build_default_app(repo_root: Path | None = None) -> tuple[Any, WebSettings]:
     return app, settings
 
 
+def create_uvicorn_app() -> Any:
+    """Uvicorn factory so every web process builds its own app lifecycle."""
+    configured_root = os.environ.get("DOF_APP_REPO_ROOT")
+    app, _ = build_default_app(Path(configured_root) if configured_root else None)
+    return app
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve the DOF human-evaluation site")
     parser.add_argument(
         "--repo-root", type=Path, default=Path(__file__).resolve().parent.parent
     )
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    if args.workers > 1:
+        if (
+            os.environ.get("DOF_RETRIEVAL_MODE", "lexical") != "lexical"
+            and os.environ.get("DOF_MANAGE_EMBED_SERVER", "true").lower()
+            in {"1", "true", "yes"}
+        ):
+            parser.error(
+                "multiple web workers require DOF_MANAGE_EMBED_SERVER=false "
+                "and one separately managed embedding server"
+            )
+        # The factory is required for Uvicorn to create the application inside
+        # each worker process. SQLite-backed claims keep their queues shared.
+        os.environ["DOF_APP_REPO_ROOT"] = str(args.repo_root.resolve())
+        uvicorn.run(
+            "human_eval.app:create_uvicorn_app",
+            factory=True,
+            workers=args.workers,
+            access_log=False,
+        )
+        return 0
     app, settings = build_default_app(args.repo_root)
     # Questions are stored deliberately, but client IP addresses are not part
     # of the evaluation dataset. Keep Uvicorn's per-request access log off.

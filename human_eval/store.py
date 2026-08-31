@@ -7,13 +7,13 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .contracts import FeedbackRequest, RunRequest, utc_now
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 TERMINAL_STATES = frozenset({"succeeded", "failed"})
 EVENT_STATES = frozenset({"queued", "started", *TERMINAL_STATES})
 PROGRESS_EVENT_TYPES = frozenset(
@@ -26,6 +26,14 @@ PROGRESS_EVENT_TYPES = frozenset(
         "verification_completed",
     }
 )
+
+
+class ActiveRunConflict(RuntimeError):
+    """The user already has a queued or running execution."""
+
+
+class QueueCapacityConflict(RuntimeError):
+    """The shared persistent queue has reached its configured capacity."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -86,6 +94,13 @@ CREATE TABLE IF NOT EXISTS feedback (
     comment TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS feedback_run_id ON feedback(run_id, created_at);
+CREATE TABLE IF NOT EXISTS model_slots (
+    slot_id INTEGER PRIMARY KEY,
+    run_id TEXT REFERENCES runs(run_id),
+    worker_id TEXT,
+    lease_until TEXT
+);
+CREATE INDEX IF NOT EXISTS model_slots_run_id ON model_slots(run_id);
 """
 
 
@@ -123,7 +138,7 @@ class EvaluationStore:
             current = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
-            if current and current[0] not in {"1", "2", SCHEMA_VERSION}:
+            if current and current[0] not in {"1", "2", "3", SCHEMA_VERSION}:
                 raise RuntimeError(
                     f"unsupported evaluation schema {current[0]!r}; expected {SCHEMA_VERSION}"
                 )
@@ -171,7 +186,10 @@ class EvaluationStore:
         *,
         user_id: str,
         provenance: dict[str, Any],
+        queue_capacity: int | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if queue_capacity is not None and queue_capacity < 1:
+            raise ValueError("queue_capacity must be positive")
         created_at = utc_now()
         run_id = str(uuid.uuid4())
         with self._connect() as connection:
@@ -187,6 +205,24 @@ class EvaluationStore:
                     found = self.get_run(existing[0])
                     assert found is not None
                     return found, False
+            if queue_capacity is not None:
+                active = connection.execute(
+                    "SELECT 1 FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                    "WHERE r.user_id = ? AND e.sequence = "
+                    "(SELECT MAX(e2.sequence) FROM run_events e2 "
+                    "WHERE e2.run_id = r.run_id) "
+                    "AND e.event_type IN ('queued', 'started') LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if active:
+                    raise ActiveRunConflict(user_id)
+                queued = connection.execute(
+                    "SELECT COUNT(*) FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                    "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                    "WHERE e2.run_id = r.run_id) AND e.event_type = 'queued'"
+                ).fetchone()[0]
+                if int(queued) >= queue_capacity:
+                    raise QueueCapacityConflict(queue_capacity)
             connection.execute(
                 "INSERT INTO runs(run_id, created_at, question, as_of, required_hops, "
                 "user_id, client_request_id, provenance_json) "
@@ -210,6 +246,202 @@ class EvaluationStore:
         found = self.get_run(run_id)
         assert found is not None
         return found, True
+
+    def initialize_model_slots(self, concurrency: int) -> None:
+        """Ensure the shared SQLite scheduler has slots for this process."""
+        if concurrency < 1:
+            raise ValueError("model concurrency must be positive")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.executemany(
+                "INSERT OR IGNORE INTO model_slots(slot_id) VALUES (?)",
+                ((slot_id,) for slot_id in range(1, concurrency + 1)),
+            )
+
+    @staticmethod
+    def _lease_until(seconds: float) -> str:
+        return (
+            datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        ).isoformat().replace("+00:00", "Z")
+
+    def queue_depth(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                "WHERE e2.run_id = r.run_id) AND e.event_type = 'queued'"
+            ).fetchone()
+        return int(row[0])
+
+    def model_activity(self, concurrency: int) -> dict[str, int]:
+        if concurrency < 1:
+            raise ValueError("model concurrency must be positive")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM model_slots WHERE slot_id <= ? AND run_id IS NOT NULL",
+                (concurrency,),
+            ).fetchone()
+        active = int(row[0])
+        return {"active": active, "capacity": concurrency, "available": concurrency - active}
+
+    def claim_next_run(
+        self,
+        *,
+        worker_id: str,
+        concurrency: int,
+        lease_seconds: float,
+    ) -> tuple[str, int] | None:
+        """Atomically claim the oldest queued run and one model slot."""
+        if concurrency < 1 or lease_seconds <= 0:
+            raise ValueError("invalid scheduler limits")
+        now = utc_now()
+        lease_until = self._lease_until(lease_seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            slot = connection.execute(
+                "SELECT slot_id FROM model_slots "
+                "WHERE slot_id <= ? AND run_id IS NULL ORDER BY slot_id LIMIT 1",
+                (concurrency,),
+            ).fetchone()
+            if slot is None:
+                return None
+            run = connection.execute(
+                "SELECT r.run_id FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                "WHERE e2.run_id = r.run_id) AND e.event_type = 'queued' "
+                "ORDER BY r.created_at, r.run_id LIMIT 1"
+            ).fetchone()
+            if run is None:
+                return None
+            run_id = str(run[0])
+            slot_id = int(slot[0])
+            connection.execute(
+                "UPDATE model_slots SET run_id = ?, worker_id = ?, lease_until = ? "
+                "WHERE slot_id = ? AND run_id IS NULL",
+                (run_id, worker_id, lease_until, slot_id),
+            )
+            current = connection.execute(
+                "SELECT sequence FROM run_events WHERE run_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(run_id)
+            connection.execute(
+                "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                "VALUES (?, ?, 'started', ?, '{}')",
+                (run_id, int(current[0]) + 1, now),
+            )
+        return run_id, slot_id
+
+    def renew_model_slot(
+        self,
+        *,
+        run_id: str,
+        slot_id: int,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> bool:
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE model_slots SET lease_until = ? WHERE slot_id = ? "
+                "AND run_id = ? AND worker_id = ?",
+                (self._lease_until(lease_seconds), slot_id, run_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def release_model_slot(self, *, run_id: str, slot_id: int, worker_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE model_slots SET run_id = NULL, worker_id = NULL, lease_until = NULL "
+                "WHERE slot_id = ? AND run_id = ? AND worker_id = ?",
+                (slot_id, run_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def expire_model_leases(self, worker_id: str) -> int:
+        """Make this process's unfinished claims recoverable after shutdown."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE model_slots SET lease_until = ? WHERE worker_id = ? "
+                "AND run_id IS NOT NULL",
+                (utc_now(), worker_id),
+            )
+        return cursor.rowcount
+
+    def recover_expired_model_slots(self) -> int:
+        """Fail runs whose scheduler lease expired without a heartbeat."""
+        now = utc_now()
+        recovered = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            slots = connection.execute(
+                "SELECT slot_id, run_id FROM model_slots WHERE run_id IS NOT NULL "
+                "AND lease_until IS NOT NULL AND lease_until <= ?",
+                (now,),
+            ).fetchall()
+            for slot in slots:
+                run_id = str(slot[1])
+                current = connection.execute(
+                    "SELECT event_type, sequence FROM run_events WHERE run_id = ? "
+                    "ORDER BY sequence DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if current is not None and current[0] == "started":
+                    connection.execute(
+                        "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                        "VALUES (?, ?, 'failed', ?, ?)",
+                        (
+                            run_id,
+                            int(current[1]) + 1,
+                            now,
+                            _json({
+                                "code": "service_restarted",
+                                "message": "La ejecución se interrumpió antes de terminar.",
+                            }),
+                        ),
+                    )
+                    recovered += 1
+                connection.execute(
+                    "UPDATE model_slots SET run_id = NULL, worker_id = NULL, lease_until = NULL "
+                    "WHERE slot_id = ?",
+                    (int(slot[0]),),
+                )
+        return recovered
+
+    def recover_unclaimed_started_runs(self) -> int:
+        """Recover pre-v4 started runs that have no scheduler lease."""
+        now = utc_now()
+        recovered = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            runs = connection.execute(
+                "SELECT r.run_id, e.sequence FROM runs r JOIN run_events e "
+                "ON e.run_id = r.run_id WHERE e.sequence = (SELECT MAX(e2.sequence) "
+                "FROM run_events e2 WHERE e2.run_id = r.run_id) "
+                "AND e.event_type = 'started' AND NOT EXISTS ("
+                "SELECT 1 FROM model_slots s WHERE s.run_id = r.run_id)"
+            ).fetchall()
+            for run in runs:
+                connection.execute(
+                    "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                    "VALUES (?, ?, 'failed', ?, ?)",
+                    (
+                        str(run[0]),
+                        int(run[1]) + 1,
+                        now,
+                        _json(
+                            {
+                                "code": "service_restarted",
+                                "message": "La ejecución se interrumpió antes de terminar.",
+                            }
+                        ),
+                    ),
+                )
+                recovered += 1
+        return recovered
 
     def find_idempotent_run(
         self, user_id: str, client_request_id: str | None
@@ -434,6 +666,11 @@ class EvaluationStore:
             ).fetchone()
             if latest is not None and latest[0] in ("queued", "started"):
                 raise ValueError("active runs cannot be deleted")
+            connection.execute(
+                "UPDATE model_slots SET run_id = NULL, worker_id = NULL, "
+                "lease_until = NULL WHERE run_id = ?",
+                (run_id,),
+            )
             for table in ("run_progress", "run_events", "feedback", "runs"):
                 connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
 
@@ -696,6 +933,11 @@ class EvaluationStore:
             run_ids = [row[0] for row in rows]
             if run_ids:
                 placeholders = ",".join("?" for _ in run_ids)
+                connection.execute(
+                    f"UPDATE model_slots SET run_id = NULL, worker_id = NULL, "
+                    f"lease_until = NULL WHERE run_id IN ({placeholders})",
+                    run_ids,
+                )
                 for table in ("run_progress", "run_events", "feedback", "runs"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE run_id IN ({placeholders})",
@@ -715,6 +957,11 @@ class EvaluationStore:
             ).fetchone()
             if exists is None:
                 return False
+            connection.execute(
+                "UPDATE model_slots SET run_id = NULL, worker_id = NULL, "
+                "lease_until = NULL WHERE run_id = ?",
+                (run_id,),
+            )
             for table in ("run_progress", "run_events", "feedback", "runs"):
                 connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
         return True

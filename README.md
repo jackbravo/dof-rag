@@ -186,6 +186,15 @@ llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
   --jinja --alias qwen3.8 --reasoning-preserve -c 32768 -np 1
 ```
 
+`-np` es la capacidad de inferencia del servidor. La aplicación la refleja en
+`DOF_MODEL_CONCURRENCY`; ambos valores deben ser iguales y deben fijarse por
+equipo después de medir memoria y latencia. Por ejemplo, usa `1` en un M3 de
+32 GB y usa `3` o `4` en DGX Spark sólo si esa configuración pasa el benchmark.
+`DOF_QUEUE_CAPACITY` limita las preguntas esperando, no las que ya están en
+inferencia. La cola y los slots se coordinan en `var/human_evaluation.sqlite`,
+por lo que varias aplicaciones web en la misma máquina comparten la misma
+capacidad.
+
 Qwen3.8 usa razonamiento `xhigh` por defecto. El agente envía
 `reasoning_effort=low` en cada petición para evitar sobre-razonamiento en el
 bucle de hasta ocho turnos; se puede cambiar con `DOF_REASONING_EFFORT` a
@@ -203,6 +212,7 @@ Con el servidor escuchando en `http://127.0.0.1:8080/` (verifica el id con
 set -a; source .env; set +a
 export DOF_AGENT_PROVIDER=llama-server DOF_AGENT_MODEL=qwen3.8 \
   DOF_REASONING_EFFORT=low DOF_RETRIEVAL_MODE=hybrid \
+  DOF_MODEL_CONCURRENCY=1 DOF_QUEUE_CAPACITY=4 \
   DOF_WEB_HOST=0.0.0.0 DOF_WEB_PORT=8765
 uv run python -m human_eval.app
 ```
@@ -212,6 +222,15 @@ uv run python -m human_eval.app
   modo `hybrid` usa `DOF_EMBED_PORT` (8086 por defecto). Pueden correr a la vez,
   pero la aplicación rechaza configuraciones donde ambos intenten usar el mismo
   puerto local.
+- Para ejecutar varios procesos web en una sola máquina, inicia la aplicación
+  con `uv run python -m human_eval.app --workers 4`. Todos deben usar el mismo
+  `DOF_HUMAN_EVAL_DB`; SQLite en modo WAL coordina la cola y los leases, y el
+  límite global sigue siendo `DOF_MODEL_CONCURRENCY`, no cuatro veces ese valor.
+- Con varios procesos web, ejecuta el servidor de embeddings una sola vez y
+  configura `DOF_MANAGE_EMBED_SERVER=false` en la aplicación. Por ejemplo:
+  `llama-server -m ~/dof-gguf/jina-v5-small-retrieval-F16.gguf --embedding
+  --host 127.0.0.1 --port 8086 -c 8192`. Así cada proceso consulta el servidor
+  compartido sin intentar abrir de nuevo el puerto 8086.
 
 - Visitantes anónimos leen las respuestas publicadas. Con cuenta: 1 pregunta cada 24 h (`DOF_DAILY_QUESTION_LIMIT`) y hay que evaluar una respuesta publicada antes de cada pregunta, incluida la primera. Los administradores publican y despublican en `/admin/queue` (rol vía `public_metadata.role = "admin"` en el dashboard de Clerk).
 - Recuperación híbrida para preguntas en vivo: `DOF_RETRIEVAL_MODE=hybrid` (requiere el índice vec0 y `DOF_GGUF_MODEL`; el servidor de embeddings llama-server se levanta una sola vez por proceso, con `DOF_EMBED_PORT`, por defecto 8086).

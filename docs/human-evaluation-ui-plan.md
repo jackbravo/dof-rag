@@ -9,7 +9,7 @@ deben actualizarlo en el mismo cambio de código.
 - El sitio de evaluación vive por completo en `dof-rag`; no depende de
   `dof-rag-website`, Astro, GitHub Pages ni su `base` path.
 - Se usa una aplicación Python de mismo origen con Air, HTML progresivo y una
-  cola local. Air se fija en `0.35.0`, última versión compatible con el Python
+  cola SQLite compartida entre procesos del mismo nodo. Air se fija en `0.35.0`, última versión compatible con el Python
   3.12 administrado por el proyecto; versiones posteriores requieren Python
   3.13.
 - Sí se guardan las preguntas y las respuestas. Sin ese par no sería posible
@@ -40,7 +40,9 @@ Incluye:
 - snapshot por ejecución de código, corpus, chunks, índice, modelo y
   configuración;
 - historial reciente del mismo evaluador;
-- operación inicial desde la MacBook Pro actual con un solo worker.
+- operación inicial desde la MacBook Pro actual con un worker por defecto;
+  varios procesos web en el mismo nodo son compatibles cuando comparten la
+  base SQLite de evaluación.
 
 ## Fuera del MVP
 
@@ -52,7 +54,8 @@ Incluye:
   argumentos de herramientas;
 - acceso directo del navegador a SQLite;
 - streaming token a token o de razonamiento privado, cancelación fuerte de una
-  llamada ya enviada al proveedor, múltiples workers o alta disponibilidad;
+  llamada ya enviada al proveedor, alta disponibilidad o coordinación entre
+  varios nodos;
 - búsqueda web o fuentes distintas del corpus DOF;
 - integrar la UI en Astro durante el MVP. El sitio público podría enlazar a la
   app más adelante, pero no forma parte de su ruta de ejecución.
@@ -66,7 +69,7 @@ Navegador
 Aplicación Air en dof-rag
   - UI y rutas HTTP en human_eval/app.py
   - sesión, CSRF, validación y límites
-  - EvaluationService + cola local, 1 worker
+  - EvaluationService + cola SQLite compartida, slots y leases transaccionales
   - SQLite de evaluación separado
   |
   v
@@ -88,11 +91,13 @@ no sustituyen una cola recuperable. `EvaluationService` responde rápido con un
 quedaron en cola. Una ejecución que estaba iniciada se marca fallida al
 reiniciar, porque no puede saberse si la llamada externa terminó.
 
-El MVP admite exactamente un proceso web y un worker. Dentro de ese proceso,
-un bloqueo de ciclo de vida hace atómica la decisión `has_active_run` +
-`create_run` para cada evaluador. Esa garantía no se extiende a varios procesos;
-escalar horizontalmente requerirá mover admisión y cola a una transacción o
-servicio compartido.
+El servicio admite varios procesos web en una misma máquina. La cola persistente
+y los slots de inferencia se coordinan en SQLite con WAL: una transacción de
+admisión impide exceder la cola global y una transacción de claim asigna cada
+ejecución a un único slot con lease. Los procesos web pueden multiplicarse para
+mantener responsivos HTTP y SSE, pero la concurrencia real del modelo sigue
+siendo el valor configurado en `DOF_MODEL_CONCURRENCY`. SQLite sigue siendo una
+solución de un nodo; varios nodos requerirán un servicio compartido.
 
 ## Contrato HTTP v1
 
@@ -340,8 +345,8 @@ incompleta; continúa siendo evaluable.
   fechas, enums y campos. El navegador nunca controla rutas de bases o
   parámetros arbitrarios.
 - Límites iniciales: una ejecución activa por evaluador, diez creaciones por
-  hora, cola global de veinte y un worker. Turnos y llamadas a herramientas
-  también están acotados en el backend.
+  hora, cola global de veinte y concurrencia de modelo configurable. Turnos y
+  llamadas a herramientas también están acotados en el backend.
 - Las ejecuciones solo son visibles para el hash de evaluador propietario. Los
   endpoints públicos de salud/capacidades no incluyen rutas locales ni secretos.
 - El stream exige la misma sesión y propiedad, lleva `no-store`, se puede
@@ -501,8 +506,9 @@ La procedencia separa `vector_available` (el artefacto existe en disco) de
   Python 3.13, mantener 0.35 o sustituir solo la capa web.
 - Exponer la MacBook requiere elegir túnel/proxy, dominio, supervisor y política
   de actualización antes de invitar evaluadores.
-- La cola y el rate limit son locales y se reinician con el proceso; son
-  suficientes para un piloto de un nodo, no para varios procesos.
+- La cola y los leases son persistentes y compartidos entre procesos en un
+  nodo. No se debe colocar esta base en un sistema de archivos de red ni usarla
+  como coordinador entre varios nodos.
 - Falta incorporar una verificación mínima del MVP a GitHub Actions; se mantiene
   como trabajo posterior para no mezclar infraestructura de CI con este PR.
 - Deben fijarse presupuesto por modelo, timeout efectivo y respuesta ante cuota

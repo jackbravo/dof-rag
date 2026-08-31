@@ -98,11 +98,13 @@ Con 403 segundos por una pregunta, un solo slot atendería como máximo unas nue
 preguntas similares por hora, antes de considerar pausas, preguntas más
 difíciles o errores. La beta debe asumir poca concurrencia desde el principio.
 
-La aplicación ya persiste las corridas en SQLite y vuelve a encolar las que no
-habían empezado después de un reinicio. Para un solo proceso, esto nos da una
-base suficiente. Lo siguiente es:
+La aplicación persiste las corridas en SQLite. La admisión y los slots de
+inferencia ahora pueden compartirse entre varios procesos web en una misma
+máquina mediante claims y leases transaccionales; SQLite sigue siendo una
+coordinación de un solo nodo. Lo siguiente es:
 
-- fijar una capacidad global y mantener una sola pregunta activa por usuario;
+- fijar una capacidad global (`DOF_MODEL_CONCURRENCY`) independiente del número
+  de procesos web y mantener una sola pregunta activa por usuario;
 - limitar el largo de la cola y responder con `Retry-After` cuando se llene;
 - mostrar posición y espera aproximada en la interfaz;
 - distinguir tiempo en cola de tiempo de inferencia;
@@ -121,9 +123,9 @@ separa la espera en cola del tiempo de procesamiento usando las marcas de
 timeouts por turno y por corrida, la detección del modelo caído antes de admitir
 y la pausa administrativa de admisión.
 
-Leases, reclamo atómico entre procesos y una base distinta a SQLite serán
-necesarios si llegamos a operar varios workers. No hacen falta para la primera
-beta en una sola máquina.
+Para varios nodos necesitaremos un coordinador distinto a SQLite. Para varios
+workers en una sola máquina, los leases y el reclamo atómico ya mantienen una
+cola global y una capacidad de modelo global.
 
 ### 4. Preparar una beta que podamos operar
 
@@ -185,8 +187,8 @@ inferencia. Eso permite cambiar una pieza sin rehacer el proyecto.
 1. Un reporte reproducible con 10 a 20 preguntas y métricas por turno.
 2. Resultados de herramientas compactos, con comparación antes/después en
    tokens, latencia y calidad.
-3. Admisión con capacidad global, cola visible, `Retry-After` y métricas de
-   espera.
+3. Métricas de capacidad global, recuperación de leases y una línea de
+   operación para varios procesos web.
 
 Después de esos tres trabajos podremos fijar una concurrencia inicial y abrir
 una beta pequeña con datos, no con estimaciones.

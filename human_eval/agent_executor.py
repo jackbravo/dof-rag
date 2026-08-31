@@ -56,6 +56,8 @@ class AgentExecutorConfig:
     reasoning_effort: str | None = "low"
     max_model_turns: int = 8
     max_tool_calls: int = 8
+    model_concurrency: int = 1
+    manage_embed_server: bool = True
     retrieval_mode: str = "lexical"
     base_url: str | None = None
 
@@ -100,6 +102,14 @@ class AgentExecutorConfig:
         embed_port = int(os.environ.get("DOF_EMBED_PORT", "8086"))
         if not 1 <= embed_port <= 65535:
             raise ValueError("DOF_EMBED_PORT must be between 1 and 65535")
+        model_concurrency = int(os.environ.get("DOF_MODEL_CONCURRENCY", "1"))
+        if model_concurrency < 1:
+            raise ValueError("DOF_MODEL_CONCURRENCY must be positive")
+        manage_embed_server_value = os.environ.get(
+            "DOF_MANAGE_EMBED_SERVER", "true"
+        ).lower()
+        if manage_embed_server_value not in {"1", "0", "true", "false", "yes", "no"}:
+            raise ValueError("DOF_MANAGE_EMBED_SERVER must be a boolean")
         base_url = os.environ.get("DOF_AGENT_BASE_URL")
         if provider == "llama-server" and retrieval_mode != "lexical":
             host, agent_port = _endpoint_port(
@@ -126,6 +136,8 @@ class AgentExecutorConfig:
             reasoning_effort=os.environ.get("DOF_REASONING_EFFORT", "low") or None,
             max_model_turns=int(os.environ.get("DOF_MAX_MODEL_TURNS", "8")),
             max_tool_calls=int(os.environ.get("DOF_MAX_TOOL_CALLS", "8")),
+            model_concurrency=model_concurrency,
+            manage_embed_server=manage_embed_server_value in {"1", "true", "yes"},
             retrieval_mode=retrieval_mode,
             base_url=base_url,
         )
@@ -218,8 +230,11 @@ class AgentRunExecutor:
                         "provider_unavailable",
                         "El modelo de embeddings no está disponible.",
                     )
+                embedder_kwargs: dict[str, Any] = {"port": self.config.embed_port}
+                if not self.config.manage_embed_server:
+                    embedder_kwargs["manage_server"] = False
                 self._embedder = LlamaQueryEmbedder(
-                    self.config.gguf_model, port=self.config.embed_port
+                    self.config.gguf_model, **embedder_kwargs
                 )
             return self._embedder
 
@@ -249,6 +264,8 @@ class AgentRunExecutor:
                 "retrieval_mode": self.config.retrieval_mode,
                 "max_model_turns": self.config.max_model_turns,
                 "max_tool_calls": self.config.max_tool_calls,
+                "model_concurrency": self.config.model_concurrency,
+                "manage_embed_server": self.config.manage_embed_server,
                 "reasoning_effort": self.config.reasoning_effort,
             },
         }

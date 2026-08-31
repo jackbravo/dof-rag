@@ -207,7 +207,14 @@ class QueryEmbedder(Protocol):
 class LlamaQueryEmbedder:
     """Keep one local llama-server alive for an interactive session."""
 
-    def __init__(self, gguf: Path, *, port: int = 8086, ctx: int = 8192):
+    def __init__(
+        self,
+        gguf: Path,
+        *,
+        port: int = 8086,
+        ctx: int = 8192,
+        manage_server: bool = True,
+    ):
         from corpus_store.embed import (
             DIMS,
             PREFIX_QUERY,
@@ -217,9 +224,10 @@ class LlamaQueryEmbedder:
         )
 
         self.port = port
+        self._manage_server = manage_server
         self._lock = threading.Lock()
         self._closed = False
-        process = start_server(gguf, ctx=ctx, port=port)
+        process = start_server(gguf, ctx=ctx, port=port) if manage_server else None
         try:
             probe = embed_batch([PREFIX_QUERY + "probe"], port)
             if probe.shape != (1, DIMS):
@@ -228,10 +236,12 @@ class LlamaQueryEmbedder:
                     f"expected (1, {DIMS})"
                 )
         except BaseException:
-            stop_server(process)
+            if process is not None:
+                stop_server(process)
             raise
         self.process = process
-        atexit.register(self.close)
+        if self._manage_server:
+            atexit.register(self.close)
 
     def embed_query(self, query: str) -> bytes:
         from corpus_store.embed import PREFIX_QUERY, embed_batch, pack_binary
@@ -249,8 +259,10 @@ class LlamaQueryEmbedder:
             if self._closed:
                 return
             self._closed = True
-            atexit.unregister(self.close)
-            stop_server(self.process)
+            if self._manage_server:
+                atexit.unregister(self.close)
+                assert self.process is not None
+                stop_server(self.process)
 
     def __enter__(self) -> "LlamaQueryEmbedder":
         return self

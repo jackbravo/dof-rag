@@ -72,6 +72,24 @@ class EmbeddingServerTests(unittest.TestCase):
         unregister.assert_called_once()
         stop.assert_called_once_with(process)
 
+    def test_external_embedder_does_not_start_or_stop_server(self):
+        with (
+            mock.patch("corpus_store.embed.start_server") as start_server,
+            mock.patch(
+                "corpus_store.embed.embed_batch",
+                return_value=np.zeros((1, DIMS), dtype=np.float32),
+            ) as embed_batch,
+            mock.patch("corpus_store.embed.stop_server") as stop_server,
+            mock.patch("agent_tools.retrieval.atexit.register") as register,
+        ):
+            embedder = LlamaQueryEmbedder(Path("model.gguf"), manage_server=False)
+            embedder.close()
+
+        embed_batch.assert_called_once_with(["Query: probe"], 8086)
+        start_server.assert_not_called()
+        stop_server.assert_not_called()
+        register.assert_not_called()
+
     def test_close_waits_for_an_in_flight_embedding(self):
         process = mock.Mock()
         process.poll.return_value = None

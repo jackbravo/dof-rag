@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from typing import Any, Protocol
 
 from .contracts import FeedbackRequest, RunRequest
-from .store import EvaluationStore
+from .store import ActiveRunConflict, EvaluationStore, QueueCapacityConflict
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +60,8 @@ class ReviewRequiredError(RuntimeError):
 # first local measurements (244-1,136 s per question); used only until
 # recent_durations() has real samples.
 DEFAULT_RUN_SECONDS = 480.0
+DEFAULT_LEASE_SECONDS = 120.0
+DEFAULT_POLL_SECONDS = 0.25
 
 
 class EvaluationService:
@@ -67,17 +72,44 @@ class EvaluationService:
         provenance_factory: Callable[[], dict[str, Any]],
         *,
         queue_capacity: int = 20,
+        model_concurrency: int = 1,
+        scheduler_workers: int | None = None,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
         shutdown_timeout: float = 5.0,
     ):
+        if queue_capacity < 1:
+            raise ValueError("queue_capacity must be positive")
+        if model_concurrency < 1:
+            raise ValueError("model_concurrency must be positive")
+        if scheduler_workers is not None and scheduler_workers < 1:
+            raise ValueError("scheduler_workers must be positive")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         if shutdown_timeout < 0:
             raise ValueError("shutdown_timeout must not be negative")
         self.store = store
         self.executor = executor
         self.provenance_factory = provenance_factory
+        # This is only a local wake-up queue. SQLite is the authoritative
+        # queue, so another web process can claim work independently.
         self.queue: queue.Queue[str | None] = queue.Queue(maxsize=queue_capacity)
+        self.model_concurrency = model_concurrency
+        self.scheduler_workers = scheduler_workers or model_concurrency
+        self.lease_seconds = lease_seconds
+        self.worker_id = f"{os.getpid()}-{uuid.uuid4()}"
+        self.workers: list[threading.Thread] = []
         self.worker = threading.Thread(
-            target=self._worker_loop, name="dof-human-eval-worker", daemon=True
+            target=self._worker_loop, name="dof-human-eval-worker-1", daemon=True
         )
+        self.workers.append(self.worker)
+        for index in range(2, self.scheduler_workers + 1):
+            self.workers.append(
+                threading.Thread(
+                    target=self._worker_loop,
+                    name=f"dof-human-eval-worker-{index}",
+                    daemon=True,
+                )
+            )
         self.shutdown_timeout = shutdown_timeout
         self._closing = threading.Event()
         self._lifecycle_lock = threading.Lock()
@@ -94,29 +126,13 @@ class EvaluationService:
                 raise RuntimeError("create a new service instance after closing")
             self._closing.clear()
             self.store.initialize()
-            for run_id, state in self.store.unfinished_runs():
-                if state == "started":
-                    self.store.append_event(
-                        run_id,
-                        "failed",
-                        {
-                            "code": "service_restarted",
-                            "message": "La ejecución se interrumpió al reiniciar el servicio.",
-                        },
-                    )
-                else:
-                    try:
-                        self.queue.put_nowait(run_id)
-                    except queue.Full:
-                        self.store.append_event(
-                            run_id,
-                            "failed",
-                            {
-                                "code": "queue_full",
-                                "message": "La cola local está llena.",
-                            },
-                        )
-            self.worker.start()
+            self.store.initialize_model_slots(self.model_concurrency)
+            recovered = self.store.recover_expired_model_slots()
+            recovered += self.store.recover_unclaimed_started_runs()
+            if recovered:
+                LOGGER.warning("recovered %s interrupted executions", recovered)
+            for worker in self.workers:
+                worker.start()
             self._started = True
 
     def close(self) -> None:
@@ -128,14 +144,17 @@ class EvaluationService:
             # terminal result can be persisted after shutdown begins.
             with self._write_lock:
                 self._closing.set()
-            try:
-                self.queue.put_nowait(None)
-            except queue.Full:
-                # A full queue means the worker will wake without a sentinel;
-                # it observes _closing before taking another run.
-                pass
-        self.worker.join(timeout=self.shutdown_timeout)
-        if self.worker.is_alive():
+            for _ in self.workers:
+                try:
+                    self.queue.put_nowait(None)
+                except queue.Full:
+                    break
+        for worker in self.workers:
+            worker.join(timeout=self.shutdown_timeout)
+        if any(worker.is_alive() for worker in self.workers):
+            expired = self.store.expire_model_leases(self.worker_id)
+            if expired:
+                LOGGER.warning("expired %s model leases during shutdown", expired)
             LOGGER.warning(
                 "human-evaluation worker is still waiting for an in-flight call"
             )
@@ -150,15 +169,17 @@ class EvaluationService:
         admin: bool = False,
         daily_question_limit: int = 1,
     ) -> dict[str, Any]:
-        # This lock makes has_active_run + create_run atomic inside the one
-        # process supported by the MVP. SQLite constraints still provide
-        # idempotency, but multi-process admission would require a DB lock.
+        # create_run performs the admission checks in one SQLite transaction;
+        # this lock only serializes lifecycle and executor preparation locally.
         with self._lifecycle_lock:
             if not self._started:
                 raise RuntimeError("service has not started")
             existing = self.idempotent_run(request, user_id=user_id)
             if existing is not None:
                 return existing
+            # These checks avoid preparing an expensive executor for an
+            # obviously rejected request. The transactional checks inside
+            # create_run remain authoritative across web processes.
             if self.store.has_active_run(user_id):
                 raise ActiveRunError("user already has an active run")
             if not admin:
@@ -177,29 +198,29 @@ class EvaluationService:
                         >= daily_question_limit
                     ):
                         raise QuotaExceededError("daily question limit reached")
-            if self.queue.full():
+            if self.store.queue_depth() >= self.queue.maxsize:
                 raise QueueFullError("execution queue is full")
             prepare_executor = getattr(self.executor, "prepare", None)
             if callable(prepare_executor):
                 prepare_executor()
-            run, created = self.store.create_run(
-                request,
-                user_id=user_id,
-                provenance=self.provenance_factory(),
-            )
+            try:
+                run, created = self.store.create_run(
+                    request,
+                    user_id=user_id,
+                    provenance=self.provenance_factory(),
+                    queue_capacity=self.queue.maxsize,
+                )
+            except ActiveRunConflict as exc:
+                raise ActiveRunError("user already has an active run") from exc
+            except QueueCapacityConflict as exc:
+                raise QueueFullError("execution queue is full") from exc
             if created:
                 try:
                     self.queue.put_nowait(run["run_id"])
                 except queue.Full:
-                    self.store.append_event(
-                        run["run_id"],
-                        "failed",
-                        {
-                            "code": "queue_full",
-                            "message": "La cola local está llena.",
-                        },
-                    )
-                    raise QueueFullError("execution queue is full")
+                    # Notification loss is harmless: every worker polls the
+                    # persistent queue as a fallback.
+                    pass
             return self.public_run(run["run_id"], user_id=user_id, admin=True)
 
     def idempotent_run(
@@ -239,6 +260,9 @@ class EvaluationService:
             if position is not None:
                 run["queue_position"] = position
                 run["estimated_wait_seconds"] = self.estimated_wait_seconds(position)
+                run["queue_snapshot"] = self.queue_snapshot()
+        elif run["status"] == "running":
+            run["queue_snapshot"] = self.queue_snapshot()
         return run
 
     def estimated_wait_seconds(self, position: int) -> int:
@@ -247,7 +271,8 @@ class EvaluationService:
         average = (
             sum(durations) / len(durations) if durations else DEFAULT_RUN_SECONDS
         )
-        return max(1, int(round(position * average)))
+        batches = ceil(position / self.model_concurrency)
+        return max(1, int(round(batches * average)))
 
     def queue_retry_after(self) -> int:
         """Seconds a client should wait before retrying a full queue."""
@@ -255,8 +280,15 @@ class EvaluationService:
         average = (
             sum(durations) / len(durations) if durations else DEFAULT_RUN_SECONDS
         )
-        depth = max(self.queue.qsize(), 1)
-        return max(60, int(round(depth * average)))
+        depth = max(self.store.queue_depth(), 1)
+        batches = ceil(depth / self.model_concurrency)
+        return max(60, int(round(batches * average)))
+
+    def queue_snapshot(self) -> dict[str, int]:
+        """Return shared queue state for the status UI and health endpoints."""
+        activity = self.store.model_activity(self.model_concurrency)
+        activity["queued"] = self.store.queue_depth()
+        return activity
 
     @staticmethod
     def _is_public(run: dict[str, Any]) -> bool:
@@ -288,52 +320,104 @@ class EvaluationService:
     def _worker_loop(self) -> None:
         try:
             while not self._closing.is_set():
-                run_id = self.queue.get()
                 try:
-                    if run_id is None or self._closing.is_set():
+                    notification = self.queue.get(timeout=DEFAULT_POLL_SECONDS)
+                except queue.Empty:
+                    notification = "__poll__"
+                try:
+                    if notification is None or self._closing.is_set():
                         return
+                    claim = self.store.claim_next_run(
+                        worker_id=self.worker_id,
+                        concurrency=self.model_concurrency,
+                        lease_seconds=self.lease_seconds,
+                    )
+                    if claim is None:
+                        continue
+                    run_id, slot_id = claim
                     request = self.store.get_request(run_id)
                     if request is None:
+                        self.store.release_model_slot(
+                            run_id=run_id,
+                            slot_id=slot_id,
+                            worker_id=self.worker_id,
+                        )
                         continue
-                    if not self._append_event_if_open(run_id, "started"):
-                        return
+                    heartbeat_stop = threading.Event()
+                    heartbeat = threading.Thread(
+                        target=self._lease_heartbeat,
+                        args=(heartbeat_stop, run_id, slot_id),
+                        name=f"dof-human-eval-lease-{slot_id}",
+                        daemon=True,
+                    )
+                    heartbeat.start()
                     try:
-                        result = self.executor.execute(
-                            request,
-                            on_progress=lambda event_type,
-                            payload: self._append_progress_if_open(
-                                run_id, event_type, payload
-                            ),
-                        )
-                    except PublicExecutionError as exc:
-                        if exc.__cause__ is not None:
-                            LOGGER.exception(
-                                "human-evaluation run %s failed with %s",
-                                run_id,
-                                exc.code,
+                        try:
+                            result = self.executor.execute(
+                                request,
+                                on_progress=lambda event_type,
+                                payload: self._append_progress_if_open(
+                                    run_id, event_type, payload
+                                ),
                             )
-                        self._append_event_if_open(
-                            run_id,
-                            "failed",
-                            {"code": exc.code, "message": str(exc)},
-                        )
-                    except Exception:
-                        LOGGER.exception("human-evaluation run %s failed", run_id)
-                        self._append_event_if_open(
-                            run_id,
-                            "failed",
-                            {
-                                "code": "internal_error",
-                                "message": "La ejecución no pudo completarse.",
-                            },
-                        )
-                    else:
-                        self._append_event_if_open(run_id, "succeeded", result)
+                        except PublicExecutionError as exc:
+                            if exc.__cause__ is not None:
+                                LOGGER.exception(
+                                    "human-evaluation run %s failed with %s",
+                                    run_id,
+                                    exc.code,
+                                )
+                            self._append_event_if_open(
+                                run_id,
+                                "failed",
+                                {"code": exc.code, "message": str(exc)},
+                            )
+                        except Exception:
+                            LOGGER.exception("human-evaluation run %s failed", run_id)
+                            self._append_event_if_open(
+                                run_id,
+                                "failed",
+                                {
+                                    "code": "internal_error",
+                                    "message": "La ejecución no pudo completarse.",
+                                },
+                            )
+                        else:
+                            self._append_event_if_open(run_id, "succeeded", result)
+                    finally:
+                        heartbeat_stop.set()
+                        heartbeat.join(timeout=1)
+                        if not self._closing.is_set():
+                            self.store.release_model_slot(
+                                run_id=run_id,
+                                slot_id=slot_id,
+                                worker_id=self.worker_id,
+                            )
                 finally:
-                    self.queue.task_done()
+                    if notification != "__poll__":
+                        self.queue.task_done()
         finally:
-            if self._closing.is_set():
+            if self._closing.is_set() and not any(
+                worker.is_alive() and worker is not threading.current_thread()
+                for worker in self.workers
+            ):
                 self._close_executor()
+
+    def _lease_heartbeat(
+        self, stop: threading.Event, run_id: str, slot_id: int
+    ) -> None:
+        interval = max(self.lease_seconds / 3, 0.1)
+        while not stop.wait(interval):
+            if self._closing.is_set():
+                return
+            if not self.store.renew_model_slot(
+                run_id=run_id,
+                slot_id=slot_id,
+                worker_id=self.worker_id,
+                lease_seconds=self.lease_seconds,
+            ):
+                LOGGER.warning("lost model lease for run %s", run_id)
+                return
 
     def _close_executor(self) -> None:
         # If shutdown timed out while a run was active, the worker calls this
