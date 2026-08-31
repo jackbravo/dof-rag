@@ -655,7 +655,17 @@ class DailyUpdateTests(unittest.TestCase):
             )
             with output.open("rb") as stream:
                 payload = plistlib.load(stream)
-            self.assertEqual(payload["ProgramArguments"][5], str(runner))
+            self.assertEqual(
+                payload["ProgramArguments"],
+                [
+                    "/usr/bin/nice",
+                    "-n",
+                    "10",
+                    "/usr/bin/caffeinate",
+                    "-i",
+                    str(runner),
+                ],
+            )
             self.assertEqual(
                 payload["EnvironmentVariables"]["DOF_REPO_DIR"], str(repository)
             )

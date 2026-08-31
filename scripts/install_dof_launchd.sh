@@ -23,6 +23,10 @@ render_plist() {
     # preserves spaces and XML-special characters in paths.
     install -m 0644 "$source_plist" "$destination"
     plutil -replace ProgramArguments.5 -string "$runner" "$destination"
+    # On macOS, replacing an array index with plutil appends the value while
+    # retaining the template element. Remove the now-stale placeholder so the
+    # runner is not invoked with @DOF_RUNNER@ as an extra argument.
+    plutil -remove ProgramArguments.6 "$destination"
     plutil -replace EnvironmentVariables.DOF_REPO_DIR \
         -string "$repository" "$destination"
     plutil -replace StandardOutPath \
