@@ -35,17 +35,6 @@ BATCH_SIZE = 256
 
 SOURCE_RE = re.compile(r"^[a-z0-9_]+$")  # safe for dict_chooser group names
 
-REPAIRS_DDL = """
-CREATE TABLE IF NOT EXISTS document_repairs (
-    document_id INTEGER PRIMARY KEY,
-    repaired_sha256 BLOB NOT NULL,
-    previous_markdown TEXT,
-    fts_pending INTEGER NOT NULL DEFAULT 1 CHECK (fts_pending IN (0, 1)),
-    chunks_pending INTEGER NOT NULL DEFAULT 1 CHECK (chunks_pending IN (0, 1)),
-    repaired_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-"""
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     document_id INTEGER PRIMARY KEY,
@@ -79,7 +68,7 @@ CREATE TABLE IF NOT EXISTS ingestion_log (
     docs_inserted INTEGER NOT NULL,
     bytes_inserted INTEGER NOT NULL
 );
-""" + REPAIRS_DDL
+"""
 
 # dict_chooser is source-aware so future sources (constitucion, state laws)
 # train their own dictionaries instead of diluting the DOF ones. Changing
@@ -102,37 +91,6 @@ def already_compressed(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def segments_match_source(
-    conn: sqlite3.Connection,
-    document_id: int,
-    text: str,
-    segment_threshold: int,
-) -> bool:
-    """Verify exact segment indices, offsets, and text against the source."""
-    rows = conn.execute(
-        "SELECT segment_index, start_offset, end_offset, segment_text"
-        " FROM document_segments WHERE document_id = ? ORDER BY segment_index",
-        (document_id,),
-    )
-    expected_index = 0
-    expected_start = 0
-    for segment_index, start_offset, end_offset, segment_text in rows:
-        expected_text = text[expected_start:expected_start + segment_threshold]
-        if not expected_text:
-            return False  # extra row after the source is already covered
-        expected_end = expected_start + len(expected_text)
-        if (
-            segment_index != expected_index
-            or start_offset != expected_start
-            or end_offset != expected_end
-            or segment_text != expected_text
-        ):
-            return False
-        expected_index += 1
-        expected_start = expected_end
-    return expected_start == len(text)
-
-
 def ingest_batch(conn: sqlite3.Connection, corpus: Path, batch: list[dict],
                  segment_threshold: int, source: str = "dof",
                  corpus_version: str = CORPUS_VERSION) -> tuple[int, int]:
@@ -147,78 +105,29 @@ def ingest_batch(conn: sqlite3.Connection, corpus: Path, batch: list[dict],
         for rec in batch:
             rel = rec["relpath"]
             exists = conn.execute(
-                "SELECT d.document_id, d.byte_length"
-                " FROM documents AS d WHERE d.path = ?", (rel,)).fetchone()
-            if exists and exists[1] <= segment_threshold:
-                continue  # resume: small document already ingested
+                "SELECT 1 FROM documents WHERE path = ?", (rel,)).fetchone()
+            if exists:
+                continue  # resume: already ingested
             raw = (corpus / rel).read_bytes()
             digest = hashlib.sha256(raw).digest()
             size = len(raw)
             text = raw.decode("utf-8")
             if size > segment_threshold:
                 # metadata row with empty text; content lives in segments
-                if exists:
-                    doc_id = exists[0]
-                    # Validate the complete ordered recipe, not only row count:
-                    # imported/corrupt stores can have gaps or wrong offsets
-                    # whose lengths happen to add up to the source length.
-                    if segments_match_source(
-                        conn, doc_id, text, segment_threshold
-                    ):
-                        continue  # resume: oversized doc structurally complete
-                    previous_text = "".join(
-                        row[0]
-                        for row in conn.execute(
-                            "SELECT segment_text FROM document_segments"
-                            " WHERE document_id = ? ORDER BY segment_index",
-                            (doc_id,),
-                        )
-                    )
-                    conn.execute(
-                        "UPDATE documents SET source = ?, year = ?,"
-                        " publication_date = ?, section = ?, byte_length = ?,"
-                        " sha256 = ?, corpus_version = ?"
-                        " WHERE document_id = ?",
-                        (source, rec["year"], rec["publication_date"], rec["section"],
-                         size, digest, corpus_version, doc_id))
-                    conn.execute(
-                        "DELETE FROM document_segments WHERE document_id = ?", (doc_id,))
-                    conn.execute(
-                        "INSERT INTO document_repairs"
-                        " (document_id, repaired_sha256, previous_markdown,"
-                        " fts_pending, chunks_pending) VALUES (?, ?, ?, 1, 1)"
-                        " ON CONFLICT(document_id) DO UPDATE SET"
-                        " repaired_sha256 = excluded.repaired_sha256,"
-                        " previous_markdown = CASE"
-                        "   WHEN document_repairs.fts_pending = 1"
-                        "   THEN document_repairs.previous_markdown"
-                        "   ELSE excluded.previous_markdown END,"
-                        " fts_pending = 1, chunks_pending = 1,"
-                        " repaired_at = datetime('now')",
-                        (doc_id, digest, previous_text),
-                    )
-                    print(f"  repairing incomplete oversized doc {doc_id}: {rel}",
-                          flush=True)
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO documents (path, source, year, publication_date, section,"
-                        " markdown, byte_length, sha256, corpus_version)"
-                        " VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
-                        (rel, source, rec["year"], rec["publication_date"], rec["section"],
-                         size, digest, corpus_version))
-                    doc_id = cur.lastrowid
-                for i, start in enumerate(range(0, len(text), segment_threshold)):
+                cur = conn.execute(
+                    "INSERT INTO documents (path, source, year, publication_date, section,"
+                    " markdown, byte_length, sha256, corpus_version)"
+                    " VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
+                    (rel, source, rec["year"], rec["publication_date"], rec["section"],
+                     size, digest, corpus_version))
+                doc_id = cur.lastrowid
+                for i, start in enumerate(range(0, size, segment_threshold)):
                     seg = text[start:start + segment_threshold]
                     conn.execute(
                         "INSERT INTO document_segments (document_id, segment_index,"
                         " start_offset, end_offset, segment_text) VALUES (?, ?, ?, ?, ?)",
                         (doc_id, i, start, start + len(seg), seg))
             else:
-                if exists:
-                    raise RuntimeError(
-                        f"document {rel} shrank below the segment threshold; refusing "
-                        "an implicit destructive rewrite"
-                    )
                 conn.execute(
                     "INSERT INTO documents (path, source, year, publication_date, section,"
                     " markdown, byte_length, sha256, corpus_version)"
@@ -330,9 +239,7 @@ def main() -> None:
     corpus = Path(args.corpus)
     db_path = Path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = [
-        json.loads(line) for line in Path(args.manifest).read_text().splitlines()
-    ]
+    manifest = [json.loads(l) for l in Path(args.manifest).read_text().splitlines()]
     if args.max_docs:
         manifest = manifest[: args.max_docs]
 
@@ -349,9 +256,6 @@ def main() -> None:
                      (str(args.manifest),))
         conn.execute("INSERT INTO corpus_meta VALUES ('compression_level', ?)",
                      (str(args.level),))
-        conn.commit()
-    else:
-        conn.executescript(REPAIRS_DDL)
         conn.commit()
 
     t0 = time.time()

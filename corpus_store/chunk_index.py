@@ -34,7 +34,6 @@ import time
 from pathlib import Path
 
 from corpus_store.db import connect
-from corpus_store.ingest import REPAIRS_DDL
 from rag_poc.chunker import (
     BOILERPLATE_H,
     H2_RE,
@@ -65,10 +64,6 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_document_idx ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS chunks_chunker_idx ON chunks(chunker_version);
-CREATE TABLE IF NOT EXISTS chunk_vector_invalidations (
-    chunk_id INTEGER PRIMARY KEY,
-    invalidated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 """
 
 ANCHOR = 24
@@ -237,22 +232,11 @@ def reconstruct(recipe: list, c: str) -> str:
 def iter_documents(
     conn: sqlite3.Connection,
     after_document_id: int = 0,
-    include_document_ids: set[int] | None = None,
 ):
     from corpus_store.db import fetch_document_text
-    include_document_ids = include_document_ids or set()
-    if include_document_ids:
-        placeholders = ",".join("?" for _ in include_document_ids)
-        cur = conn.execute(
-            "SELECT document_id, path, markdown FROM documents"
-            f" WHERE document_id > ? OR document_id IN ({placeholders})"
-            " ORDER BY document_id",
-            [after_document_id, *sorted(include_document_ids)],
-        )
-    else:
-        cur = conn.execute(
-            "SELECT document_id, path, markdown FROM documents"
-            " WHERE document_id > ? ORDER BY document_id", (after_document_id,))
+    cur = conn.execute(
+        "SELECT document_id, path, markdown FROM documents"
+        " WHERE document_id > ? ORDER BY document_id", (after_document_id,))
     for doc_id, path, text in cur:
         if text:
             yield doc_id, path, text
@@ -262,17 +246,13 @@ def iter_documents(
 
 def require_current_chunker_version(chunks: sqlite3.Connection) -> None:
     """Refuse to append a new chunk format to an existing versioned store."""
-    versions = {
-        row[0]
-        for row in chunks.execute(
-            "SELECT DISTINCT chunker_version FROM chunks"
-        )
-    }
-    unexpected = versions - {CHUNKER_VERSION}
+    unexpected = chunks.execute(
+        "SELECT chunker_version FROM chunks WHERE chunker_version != ? LIMIT 1",
+        (CHUNKER_VERSION,),
+    ).fetchone()
     if unexpected:
-        found = ", ".join(sorted(unexpected))
         raise RuntimeError(
-            f"chunk store contains incompatible version(s): {found}; "
+            f"chunk store contains incompatible version {unexpected[0]}; "
             f"expected {CHUNKER_VERSION}. Rebuild the chunk, vector, and vec0 "
             "stores together instead of mixing versions."
         )
@@ -300,17 +280,8 @@ def main() -> None:
         raise
 
     corpus = connect(args.corpus_db)
-    corpus.executescript(REPAIRS_DDL)
-    corpus.commit()
     corpus_version = corpus.execute(
         "SELECT value FROM corpus_meta WHERE key = 'corpus_version'").fetchone()[0]
-    repair_ids = {
-        int(row[0])
-        for row in corpus.execute(
-            "SELECT document_id FROM document_repairs"
-            " WHERE chunks_pending = 1 ORDER BY document_id"
-        )
-    }
 
     # Both stores are append-only and each document is committed only after
     # all of its chunks have been built. Avoid decompressing the full corpus
@@ -336,14 +307,12 @@ def main() -> None:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
         batch.clear()
 
-    for doc_id, path, raw in iter_documents(
-        corpus, last_document_id, repair_ids
-    ):
+    for doc_id, path, raw in iter_documents(corpus, last_document_id):
         doc_t0 = time.time()
         done = chunks.execute(
             "SELECT 1 FROM chunks WHERE document_id = ? AND chunker_version = ?"
             " LIMIT 1", (doc_id, CHUNKER_VERSION)).fetchone()
-        if done and doc_id not in repair_ids:
+        if done:
             continue  # resume
         doc_chunks = split_text(raw, len(raw.encode("utf-8")), Path(path).stem)
         c = normalized_text(raw, doc_chunks[0].pattern) if doc_chunks else ""
@@ -352,7 +321,6 @@ def main() -> None:
         cursor = 0
         lo = 0
         prev_len = 0
-        doc_batch: list[tuple] = []
         for ch in doc_chunks:
             pat = ch.pattern.value
             recipe = None
@@ -384,7 +352,7 @@ def main() -> None:
                 first = 0
                 n_fallback += 1
             n_recipe_bytes += len(json.dumps(recipe))
-            doc_batch.append((
+            batch.append((
                 doc_id, path, ch.chunk_index, pat,
                 recipe[0][0] if isinstance(recipe[0], list) else 0,
                 recipe[-1][1] if isinstance(recipe[-1], list) else 0,
@@ -396,49 +364,6 @@ def main() -> None:
             ))
             n_chunks += 1
             stats_by_pattern[pat] = stats_by_pattern.get(pat, 0) + 1
-        if doc_id in repair_ids:
-            # A repair commits rows with this document_id immediately. Flush
-            # earlier new documents first so a crash cannot advance the
-            # MAX(document_id) checkpoint past chunks that only exist in batch.
-            flush_batch()
-            old_chunk_ids = [
-                int(row[0])
-                for row in chunks.execute(
-                    "SELECT chunk_id FROM chunks WHERE document_id = ?",
-                    (doc_id,),
-                )
-            ]
-            next_chunk_id = chunks.execute(
-                "SELECT COALESCE(MAX(chunk_id), 0) + 1 FROM chunks"
-            ).fetchone()[0]
-            repair_rows = [
-                (next_chunk_id + offset, *row)
-                for offset, row in enumerate(doc_batch)
-            ]
-            with chunks:
-                chunks.executemany(
-                    "INSERT OR IGNORE INTO chunk_vector_invalidations(chunk_id)"
-                    " VALUES (?)",
-                    [(chunk_id,) for chunk_id in old_chunk_ids],
-                )
-                chunks.execute(
-                    "DELETE FROM chunks WHERE document_id = ?", (doc_id,)
-                )
-                chunks.executemany(
-                    "INSERT INTO chunks (chunk_id, document_id, path, chunk_index,"
-                    " pattern, start_offset, end_offset, spans_json, token_count,"
-                    " heading_path, chunk_hash, chunker_version, corpus_version)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    repair_rows,
-                )
-            with corpus:
-                corpus.execute(
-                    "UPDATE document_repairs SET chunks_pending = 0"
-                    " WHERE document_id = ?",
-                    (doc_id,),
-                )
-        else:
-            batch.extend(doc_batch)
         n_docs += 1
         doc_dt = time.time() - doc_t0
         if doc_dt > 60:

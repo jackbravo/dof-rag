@@ -14,18 +14,13 @@ import fcntl
 import json
 import logging
 import os
-import shutil
-import sqlite3
 import subprocess
 import sys
 from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
-import sqlite_vec
-
 from corpus_store.db import connect
-from corpus_store.ingest import REPAIRS_DDL
 from corpus_store.sampler import parse_metadata
 
 REPO = Path(__file__).resolve().parent.parent
@@ -40,13 +35,6 @@ DEFAULT_GGUF = Path.home() / "dof-gguf" / "jina-v5-small-retrieval-F16.gguf"
 CORPUS_VERSION = "dof-full-v1"
 
 LOG = logging.getLogger("dof-update")
-
-
-def parse_iso_date(value: str) -> date:
-    try:
-        return date.fromisoformat(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("expected YYYY-MM-DD") from exc
 
 
 def iter_dates(start: date, end: date):
@@ -74,7 +62,7 @@ def last_jsonl_record(path: Path) -> dict | None:
     if not path.is_file() or path.stat().st_size == 0:
         return None
     with path.open("rb") as stream:
-        position = stream.seek(0, os.SEEK_END)
+        position = stream.seek(0, 2)
         data = b""
         while position > 0:
             size = min(4096, position)
@@ -108,11 +96,6 @@ def write_state(path: Path, completed: date) -> None:
     temporary.replace(path)
 
 
-def non_regressing_watermark(current: date | None, completed: date) -> date:
-    """A successful historical window must never move state backward."""
-    return max(current, completed) if current is not None else completed
-
-
 def build_manifest(corpus: Path, start: date, end: date, output: Path) -> int:
     """Write a small manifest containing Markdown files in the update window."""
     records: list[dict] = []
@@ -141,38 +124,15 @@ def build_manifest(corpus: Path, start: date, end: date, output: Path) -> int:
     return len(records)
 
 
-def command_environment() -> dict[str, str]:
-    env = os.environ.copy()
-    home = str(Path.home())
-    preferred = [
-        f"{home}/.local/bin",
-        f"{home}/.cargo/bin",
-        "/Applications/LibreOffice.app/Contents/MacOS",
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-    ]
-    env["PATH"] = ":".join(preferred)
-    env["PYTHONUNBUFFERED"] = "1"
-    return env
-
-
-def run_step(label: str, command: list[str], *, check: bool = True) -> int:
+def run_step(label: str, *command: str) -> None:
     LOG.info("stage=%s", label)
-    result = subprocess.run(command, cwd=REPO, env=command_environment(), check=False)
-    if check and result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, command)
-    return result.returncode
+    subprocess.run([sys.executable, *command], cwd=REPO, check=True)
 
 
-def conversion_command(
-    args: argparse.Namespace, start: date, end: date
-) -> list[str]:
+def conversion_command(workers: int, start: date, end: date) -> list[str]:
     """Build a converter command scoped to the active publication window."""
     years = [str(year) for year in range(start.year, end.year + 1)]
     return [
-        sys.executable,
         "convert_doc_to_md.py",
         "--years",
         *years,
@@ -181,121 +141,12 @@ def conversion_command(
         "--end-date",
         end.isoformat(),
         "--workers",
-        str(args.workers),
+        str(workers),
         "--input-dir",
-        str(args.word_dir),
+        str(DEFAULT_WORD_DIR),
         "--output-dir",
-        str(args.corpus),
+        str(DEFAULT_CORPUS),
     ]
-
-
-def preflight(args: argparse.Namespace) -> None:
-    required_files = [
-        args.corpus_db,
-        args.chunks_db,
-        args.vectors_db,
-        args.vec0_db,
-    ]
-    executables = ["soffice", "pandoc"]
-    if not args.skip_embeddings:
-        required_files.append(args.gguf)
-        executables.append("llama-server")
-    missing = [str(path) for path in required_files if not path.is_file()]
-    if missing:
-        raise RuntimeError("missing required file(s): " + ", ".join(missing))
-    if not args.corpus.is_dir():
-        raise RuntimeError(f"canonical corpus directory not found: {args.corpus}")
-    for executable in executables:
-        if not shutil.which(executable, path=command_environment()["PATH"]):
-            raise RuntimeError(f"required executable not found: {executable}")
-    free_gib = shutil.disk_usage(args.corpus).free / 2**30
-    if free_gib < args.minimum_free_gb:
-        raise RuntimeError(
-            f"only {free_gib:.1f} GiB free; require {args.minimum_free_gb:.1f} GiB"
-        )
-
-
-def ensure_repair_schema(args: argparse.Namespace) -> None:
-    """Migrate the three writable stores before taking the initial snapshot."""
-    with closing(connect(args.corpus_db)) as corpus:
-        corpus.executescript(REPAIRS_DDL)
-        corpus.commit()
-    with closing(sqlite3.connect(args.chunks_db)) as chunks:
-        chunks.execute(
-            "CREATE TABLE IF NOT EXISTS chunk_vector_invalidations ("
-            " chunk_id INTEGER PRIMARY KEY,"
-            " invalidated_at TEXT NOT NULL DEFAULT (datetime('now')))"
-        )
-        chunks.commit()
-    with closing(sqlite3.connect(args.vectors_db)) as vectors:
-        vectors.execute(
-            "CREATE TABLE IF NOT EXISTS vector_deletions ("
-            " chunk_id INTEGER PRIMARY KEY,"
-            " recorded_at TEXT NOT NULL DEFAULT (datetime('now')))"
-        )
-        vectors.commit()
-
-
-def snapshot(args: argparse.Namespace) -> dict[str, int | str | None]:
-    with closing(connect(args.corpus_db)) as corpus:
-        documents, latest, max_document = corpus.execute(
-            "SELECT COUNT(*), MAX(publication_date), MAX(document_id) FROM documents"
-        ).fetchone()
-        fts = corpus.execute("SELECT COUNT(*) FROM documents_fts_docsize").fetchone()[0]
-        pending_repairs = corpus.execute(
-            "SELECT COUNT(*) FROM document_repairs"
-            " WHERE fts_pending = 1 OR chunks_pending = 1"
-        ).fetchone()[0]
-    with closing(sqlite3.connect(args.chunks_db)) as chunks_db:
-        chunks, chunk_documents, max_chunk_document = chunks_db.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT document_id), MAX(document_id)"
-            " FROM chunks"
-        ).fetchone()
-        pending_chunk_invalidations = chunks_db.execute(
-            "SELECT COUNT(*) FROM chunk_vector_invalidations"
-        ).fetchone()[0]
-    with closing(sqlite3.connect(args.vectors_db)) as vectors_db:
-        vectors = vectors_db.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0]
-        pending_vector_deletions = vectors_db.execute(
-            "SELECT COUNT(*) FROM vector_deletions"
-        ).fetchone()[0]
-    with closing(sqlite3.connect(args.vec0_db)) as vec0_db:
-        vec0_db.enable_load_extension(True)
-        sqlite_vec.load(vec0_db)
-        vec0 = vec0_db.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0]
-    return {
-        "documents": documents,
-        "latest_publication": latest,
-        "max_document_id": max_document,
-        "fts_documents": fts,
-        "pending_repairs": pending_repairs,
-        "chunks": chunks,
-        "chunk_documents": chunk_documents,
-        "max_chunk_document_id": max_chunk_document,
-        "pending_chunk_invalidations": pending_chunk_invalidations,
-        "vectors": vectors,
-        "pending_vector_deletions": pending_vector_deletions,
-        "vec0_vectors": vec0,
-    }
-
-
-def verify(state: dict[str, int | str | None], *, embeddings_complete: bool) -> None:
-    if state["documents"] != state["fts_documents"]:
-        raise RuntimeError(f"FTS coverage mismatch: {state}")
-    if state["pending_repairs"]:
-        raise RuntimeError(f"pending corpus repairs: {state}")
-    if state["documents"] != state["chunk_documents"]:
-        raise RuntimeError(f"chunk document coverage mismatch: {state}")
-    if state["max_document_id"] != state["max_chunk_document_id"]:
-        raise RuntimeError(f"chunk coverage mismatch: {state}")
-    if embeddings_complete and state["chunks"] != state["vectors"]:
-        raise RuntimeError(f"embedding coverage mismatch: {state}")
-    if embeddings_complete and state["pending_chunk_invalidations"]:
-        raise RuntimeError(f"pending chunk-vector invalidations: {state}")
-    if state["vectors"] != state["vec0_vectors"]:
-        raise RuntimeError(f"vec0 coverage mismatch: {state}")
-    if state["pending_vector_deletions"]:
-        raise RuntimeError(f"pending vec0 deletions: {state}")
 
 
 def acquire_lock(path: Path):
@@ -315,20 +166,12 @@ def acquire_lock(path: Path):
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-date", type=parse_iso_date)
-    parser.add_argument("--end-date", type=parse_iso_date, default=date.today())
+    parser.add_argument("--start-date", type=date.fromisoformat)
+    parser.add_argument("--end-date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--lookback-days", type=int, default=7)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--sleep-delay", type=float, default=1.0)
-    parser.add_argument("--skip-embeddings", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--minimum-free-gb", type=float, default=5.0)
-    parser.add_argument("--word-dir", type=Path, default=DEFAULT_WORD_DIR)
-    parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--db-dir", type=Path, default=DEFAULT_DB_DIR)
     parser.add_argument("--gguf", type=Path, default=DEFAULT_GGUF)
     return parser
 
@@ -345,21 +188,20 @@ def main() -> int:
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
 
-    args.corpus_db = args.db_dir / "dof_corpus_l3.sqlite"
-    args.chunks_db = args.db_dir / "dof_chunks.sqlite"
-    args.vectors_db = args.db_dir / "dof_vectors_jina_binary.sqlite"
-    args.vec0_db = args.db_dir / "dof_vec0_jina_binary.sqlite"
+    corpus_db = DEFAULT_DB_DIR / "dof_corpus_l3.sqlite"
+    chunks_db = DEFAULT_DB_DIR / "dof_chunks.sqlite"
+    vectors_db = DEFAULT_DB_DIR / "dof_vectors_jina_binary.sqlite"
+    vec0_db = DEFAULT_DB_DIR / "dof_vec0_jina_binary.sqlite"
 
-    if not args.corpus_db.is_file():
+    if not corpus_db.is_file():
         raise SystemExit(
-            f"corpus database not found: {args.corpus_db}\n"
-            "run the full corpus build first (docs/full-corpus-build.md), "
-            "or pass --db-dir"
+            f"corpus database not found: {corpus_db}\n"
+            "run the full corpus build first (docs/full-corpus-build.md)"
         )
 
-    last_publication = latest_publication(args.corpus_db)
+    last_publication = latest_publication(corpus_db)
     watermark = completed_through(
-        args.state, args.db_dir / "manifest_full.jsonl", args.corpus_db
+        DEFAULT_STATE, DEFAULT_DB_DIR / "manifest_full.jsonl", corpus_db
     )
     if args.start_date:
         start = args.start_date
@@ -380,128 +222,88 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    lock = acquire_lock(args.lock)
+    lock = acquire_lock(DEFAULT_LOCK)
     if lock is None:
         LOG.info("another DOF update is already running; exiting")
         return 0
 
     try:
-        preflight(args)
-        ensure_repair_schema(args)
-        before = snapshot(args)
-        LOG.info("before=%s", json.dumps(before, sort_keys=True))
-
-        download_code = run_step(
+        run_step(
             "download",
-            [
-                sys.executable,
-                "get_word_dof.py",
-                start.strftime("%d/%m/%Y"),
-                args.end_date.strftime("%d/%m/%Y"),
-                "--output-dir",
-                str(args.word_dir),
-                "--editions",
-                "both",
-                "--sleep-delay",
-                str(args.sleep_delay),
-            ],
-            check=False,
+            "get_word_dof.py",
+            start.strftime("%d/%m/%Y"),
+            args.end_date.strftime("%d/%m/%Y"),
+            "--output-dir",
+            str(DEFAULT_WORD_DIR),
+            "--editions",
+            "both",
+            "--sleep-delay",
+            str(args.sleep_delay),
         )
 
-        conversion_code = run_step(
-            "convert",
-            conversion_command(args, start, args.end_date),
-            check=False,
-        )
+        run_step("convert", *conversion_command(args.workers, start, args.end_date))
 
-        manifest_count = build_manifest(args.corpus, start, args.end_date, args.manifest)
-        LOG.info("manifest=%s documents=%d", args.manifest, manifest_count)
+        manifest_count = build_manifest(
+            DEFAULT_CORPUS, start, args.end_date, DEFAULT_MANIFEST
+        )
+        LOG.info("manifest=%s documents=%d", DEFAULT_MANIFEST, manifest_count)
         if manifest_count:
             run_step(
                 "corpus",
-                [
-                    sys.executable,
-                    "-m",
-                    "corpus_store.ingest",
-                    "--corpus",
-                    str(args.corpus),
-                    "--manifest",
-                    str(args.manifest),
-                    "--db",
-                    str(args.corpus_db),
-                    "--level",
-                    "3",
-                    "--corpus-version",
-                    CORPUS_VERSION,
-                ],
+                "-m",
+                "corpus_store.ingest",
+                "--corpus",
+                str(DEFAULT_CORPUS),
+                "--manifest",
+                str(DEFAULT_MANIFEST),
+                "--db",
+                str(corpus_db),
+                "--level",
+                "3",
+                "--corpus-version",
+                CORPUS_VERSION,
             )
 
         run_step(
             "fts",
-            [
-                sys.executable,
-                "scripts/build_fts_full.py",
-                "--corpus-db",
-                str(args.corpus_db),
-            ],
+            "scripts/build_fts_full.py",
+            "--corpus-db",
+            str(corpus_db),
         )
         run_step(
             "chunks",
-            [
-                sys.executable,
-                "-m",
-                "corpus_store.chunk_index",
-                "--corpus-db",
-                str(args.corpus_db),
-                "--chunks-db",
-                str(args.chunks_db),
-            ],
+            "-m",
+            "corpus_store.chunk_index",
+            "--corpus-db",
+            str(corpus_db),
+            "--chunks-db",
+            str(chunks_db),
         )
-        if not args.skip_embeddings:
-            run_step(
-                "embeddings",
-                [
-                    sys.executable,
-                    "-m",
-                    "corpus_store.embed",
-                    "--corpus-db",
-                    str(args.corpus_db),
-                    "--chunks-db",
-                    str(args.chunks_db),
-                    "--vectors-db",
-                    str(args.vectors_db),
-                    "--gguf",
-                    str(args.gguf),
-                ],
-            )
+        run_step(
+            "embeddings",
+            "-m",
+            "corpus_store.embed",
+            "--corpus-db",
+            str(corpus_db),
+            "--chunks-db",
+            str(chunks_db),
+            "--vectors-db",
+            str(vectors_db),
+            "--gguf",
+            str(args.gguf),
+        )
         run_step(
             "vec0",
-            [
-                sys.executable,
-                "scripts/build_vec0_full.py",
-                "--vectors-db",
-                str(args.vectors_db),
-                "--vec0-db",
-                str(args.vec0_db),
-            ],
+            "scripts/build_vec0_full.py",
+            "--vectors-db",
+            str(vectors_db),
+            "--vec0-db",
+            str(vec0_db),
         )
 
-        after = snapshot(args)
-        verify(after, embeddings_complete=not args.skip_embeddings)
-        LOG.info("after=%s", json.dumps(after, sort_keys=True))
-        incomplete = []
-        if download_code:
-            incomplete.append("one or more downloads failed")
-        if conversion_code:
-            incomplete.append("one or more Word conversions failed")
-        if incomplete:
-            raise RuntimeError(
-                "; ".join(incomplete)
-                + "; completed files were indexed and the next run will retry the rest"
-            )
         if watermark is None or start <= watermark + timedelta(days=1):
-            completed = non_regressing_watermark(watermark, args.end_date)
-            write_state(args.state, completed)
+            completed = max(watermark, args.end_date) if watermark else args.end_date
+            write_state(DEFAULT_STATE, completed)
             LOG.info("completed_through=%s", completed)
         else:
             LOG.info(

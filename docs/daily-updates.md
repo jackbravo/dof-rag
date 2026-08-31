@@ -14,7 +14,6 @@ native macOS scheduler and runs a missed calendar job after the Mac wakes.
 3. Append new documents to `dof_db/dof_corpus_l3.sqlite`.
 4. Add the documents to FTS5 and build their chunk recipes.
 5. Generate Jina binary embeddings and append them to the sqlite-vec index.
-6. Verify that document, FTS, chunk, embedding, and vec0 coverage agree.
 
 Downloads are content-checked: an HTML error page returned under a `.doc`
 filename is rejected and retried on the next run. The converter applies the
@@ -22,12 +21,12 @@ same check and quarantines such files to `<name>.doc.invalid`, which is
 invisible to both the `*.doc` conversion scan and the downloader's resume
 glob, so a stale error page can never block the watermark forever.
 Conversion is restricted to the active date window, so an unrelated failed
-file elsewhere in the same year cannot block today's watermark. Failures
-inside the active window keep the contiguous completion watermark unchanged
-while successfully converted documents continue through the indexes. When a
-DOF listing page has no Word links, SIDOF notices for that date are still
-checked. Empty HTTP 200 responses count as successful only when the expected
-dated DOF/SIDOF page structure or DOF's explicit empty-date message is present.
+file elsewhere in the same year cannot block today's watermark. A failed stage
+stops the run and leaves the contiguous completion watermark unchanged; files
+already downloaded or converted remain available for the next run. When a DOF
+listing page has no Word links, SIDOF notices for that date are still checked.
+Empty HTTP 200 responses count as successful only when the expected dated
+DOF/SIDOF page structure or DOF's explicit empty-date message is present.
 
 The updater uses a non-blocking lock, so a scheduled run exits harmlessly if a
 catch-up is still running. It keeps raw Word files for auditability and because
@@ -112,9 +111,6 @@ must rebuild `dof_chunks.sqlite`, `dof_vectors_jina_binary.sqlite`, and
 `dof_vec0_jina_binary.sqlite` together; the daily updater refuses to mix old
 and new chunk recipes in live retrieval indexes.
 
-If ingestion repairs an interrupted oversized document, it records that
-document in a durable repair ledger. The FTS builder replaces the stale terms,
-the chunk builder revisits the document even when it is below its checkpoint,
-and the embedding and vec0 builders consume deletion queues before adding the
-replacement chunks. The updater advances its watermark only after those queues
-are empty and all four indexes agree on coverage.
+The daily pipeline is intentionally append-only. Replacing an already ingested
+path or repairing historical corpus rows is an offline migration and must
+rebuild or explicitly reconcile the affected derived indexes.
