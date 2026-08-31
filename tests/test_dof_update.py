@@ -590,6 +590,118 @@ class DailyUpdateTests(unittest.TestCase):
             )
             corpus.close()
 
+    def test_new_chunks_are_flushed_before_repair_checkpoint_advances(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus_db = root / "corpus.sqlite"
+            chunks_db = root / "chunks.sqlite"
+            corpus = sqlite3.connect(corpus_db)
+            corpus.executescript(SCHEMA)
+            corpus.execute(
+                "INSERT INTO corpus_meta(key, value) VALUES ('corpus_version', 'v1')"
+            )
+            for path, text in (
+                ("old.md", "old document"),
+                ("new.md", "new document"),
+                ("repair.md", "repaired document"),
+            ):
+                raw = text.encode()
+                corpus.execute(
+                    "INSERT INTO documents(path, year, publication_date, section,"
+                    " markdown, byte_length, sha256, corpus_version)"
+                    " VALUES (?, 2026, '2026-08-26', 'MAT', ?, ?, ?, 'v1')",
+                    (path, text, len(raw), hashlib.sha256(raw).digest()),
+                )
+            corpus.execute(
+                "INSERT INTO document_repairs"
+                " (document_id, repaired_sha256, previous_markdown,"
+                " fts_pending, chunks_pending) VALUES (3, ?, 'stale', 0, 1)",
+                (hashlib.sha256(b"repaired document").digest(),),
+            )
+            corpus.commit()
+            corpus.close()
+
+            chunks = sqlite3.connect(chunks_db)
+            chunks.executescript(chunk_index.SCHEMA)
+            chunks.execute(
+                "INSERT INTO chunks (chunk_id, document_id, path, chunk_index, pattern,"
+                " start_offset, end_offset, spans_json, token_count, heading_path,"
+                " chunk_hash, chunker_version, corpus_version) VALUES"
+                " (1, 1, 'old.md', 0, 'plain_text', 0, 3, '{\"l\":\"old\"}',"
+                " 1, '[]', ?, ?, 'v1')",
+                (b"0" * 32, chunk_index.CHUNKER_VERSION),
+            )
+            chunks.commit()
+            chunks.close()
+
+            class ChunkConnectionProxy:
+                def __init__(self, connection):
+                    self.connection = connection
+                    self.chunk_inserts = 0
+
+                def __enter__(self):
+                    self.connection.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.connection.__exit__(*args)
+
+                def executemany(self, sql, parameters):
+                    rows = list(parameters)
+                    if sql.lstrip().startswith("INSERT INTO chunks"):
+                        self.chunk_inserts += 1
+                        # Before the fix, document 2 is the final flush after
+                        # repair document 3 has already advanced the checkpoint.
+                        if rows and rows[0][0] == 2 and self.chunk_inserts > 1:
+                            raise RuntimeError("simulated crash before final flush")
+                    return self.connection.executemany(sql, rows)
+
+                def __getattr__(self, name):
+                    return getattr(self.connection, name)
+
+            real_connect = sqlite3.connect
+            proxy = None
+
+            def connect_for_test(path, *args, **kwargs):
+                nonlocal proxy
+                connection = real_connect(path, *args, **kwargs)
+                if str(path) == str(chunks_db):
+                    proxy = ChunkConnectionProxy(connection)
+                    return proxy
+                return connection
+
+            def generated(text, *_):
+                return [
+                    SimpleNamespace(
+                        text=text,
+                        pattern=DocPattern.PLAIN_TEXT,
+                        chunk_index=0,
+                        heading_path=[],
+                    )
+                ]
+            argv = [
+                "chunk_index",
+                "--corpus-db", str(corpus_db),
+                "--chunks-db", str(chunks_db),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(chunk_index.sqlite3, "connect", side_effect=connect_for_test),
+                mock.patch.object(chunk_index, "split_text", side_effect=generated),
+                mock.patch.object(chunk_index, "_count_tokens", return_value=1),
+            ):
+                chunk_index.main()
+
+            self.assertEqual(proxy.chunk_inserts, 2)
+            check = sqlite3.connect(chunks_db)
+            self.assertEqual(
+                check.execute(
+                    "SELECT document_id FROM chunks ORDER BY document_id"
+                ).fetchall(),
+                [(1,), (2,), (3,)],
+            )
+            check.close()
+
     def test_repaired_document_replaces_stale_fts_tokens(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript(SCHEMA)

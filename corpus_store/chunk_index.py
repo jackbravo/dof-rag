@@ -324,6 +324,18 @@ def main() -> None:
     n_docs = n_chunks = n_fallback = n_recipe_bytes = 0
     stats_by_pattern: dict[str, int] = {}
     batch: list[tuple] = []
+
+    def flush_batch() -> None:
+        if not batch:
+            return
+        with chunks:
+            chunks.executemany(
+                "INSERT INTO chunks (document_id, path, chunk_index, pattern,"
+                " start_offset, end_offset, spans_json, token_count,"
+                " heading_path, chunk_hash, chunker_version, corpus_version)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+        batch.clear()
+
     for doc_id, path, raw in iter_documents(
         corpus, last_document_id, repair_ids
     ):
@@ -385,6 +397,10 @@ def main() -> None:
             n_chunks += 1
             stats_by_pattern[pat] = stats_by_pattern.get(pat, 0) + 1
         if doc_id in repair_ids:
+            # A repair commits rows with this document_id immediately. Flush
+            # earlier new documents first so a crash cannot advance the
+            # MAX(document_id) checkpoint past chunks that only exist in batch.
+            flush_batch()
             old_chunk_ids = [
                 int(row[0])
                 for row in chunks.execute(
@@ -429,23 +445,11 @@ def main() -> None:
             print(f"  SLOW doc {doc_id} ({doc_dt:.0f}s, {len(raw) / 2**20:.1f} MiB,"
                   f" {len(doc_chunks)} chunks): {path}", flush=True)
         if len(batch) >= 5000:
-            with chunks:
-                chunks.executemany(
-                    "INSERT INTO chunks (document_id, path, chunk_index, pattern,"
-                    " start_offset, end_offset, spans_json, token_count,"
-                    " heading_path, chunk_hash, chunker_version, corpus_version)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
-            batch.clear()
+            flush_batch()
         if n_docs % 1000 == 0:
             print(f"  {n_docs:,} docs, {n_chunks:,} chunks "
                   f"({time.time() - t0:.0f}s)", flush=True)
-    if batch:
-        with chunks:
-            chunks.executemany(
-                "INSERT INTO chunks (document_id, path, chunk_index, pattern,"
-                " start_offset, end_offset, spans_json, token_count,"
-                " heading_path, chunk_hash, chunker_version, corpus_version)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+    flush_batch()
 
     chunks.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     size = chunks_path.stat().st_size
