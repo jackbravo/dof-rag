@@ -184,19 +184,37 @@ class DailyUpdateTests(unittest.TestCase):
             )
             self.assertEqual(get_word_dof.ERROR_COUNT, 1)
 
-    def test_chunk_store_rejects_mixed_chunker_versions(self):
+    def test_chunk_store_rejects_versions_on_either_side_of_current(self):
+        for version in ("aaa-older-version", "zzz-newer-version"):
+            with self.subTest(version=version):
+                chunks = sqlite3.connect(":memory:")
+                chunks.executescript(chunk_index.SCHEMA)
+                chunks.execute(
+                    "INSERT INTO chunks (document_id, path, chunk_index, pattern,"
+                    " start_offset, end_offset, spans_json, token_count, heading_path,"
+                    " chunk_hash, chunker_version, corpus_version)"
+                    " VALUES (1, 'x', 0, 'plain_text', 0, 1, '[]', 1, '[]',"
+                    " ?, ?, 'v1')",
+                    (b"0" * 32, version),
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "Rebuild the chunk"):
+                    chunk_index.require_current_chunker_version(chunks)
+
+                chunks.close()
+
+    def test_chunk_store_accepts_only_current_version(self):
         chunks = sqlite3.connect(":memory:")
         chunks.executescript(chunk_index.SCHEMA)
         chunks.execute(
             "INSERT INTO chunks (document_id, path, chunk_index, pattern,"
             " start_offset, end_offset, spans_json, token_count, heading_path,"
             " chunk_hash, chunker_version, corpus_version)"
-            " VALUES (1, 'x', 0, 'plain_text', 0, 1, '[]', 1, '[]', ?, 'old', 'v1')",
-            (b"0" * 32,),
+            " VALUES (1, 'x', 0, 'plain_text', 0, 1, '[]', 1, '[]', ?, ?, 'v1')",
+            (b"0" * 32, chunk_index.CHUNKER_VERSION),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "Rebuild the chunk"):
-            chunk_index.require_current_chunker_version(chunks)
+        chunk_index.require_current_chunker_version(chunks)
 
         chunks.close()
 

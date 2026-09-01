@@ -247,9 +247,14 @@ def iter_documents(
 def require_current_chunker_version(chunks: sqlite3.Connection) -> None:
     """Refuse to append a new chunk format to an existing versioned store."""
     unexpected = chunks.execute(
-        "SELECT chunker_version FROM chunks WHERE chunker_version != ? LIMIT 1",
+        "SELECT chunker_version FROM chunks WHERE chunker_version < ? LIMIT 1",
         (CHUNKER_VERSION,),
     ).fetchone()
+    if unexpected is None:
+        unexpected = chunks.execute(
+            "SELECT chunker_version FROM chunks WHERE chunker_version > ? LIMIT 1",
+            (CHUNKER_VERSION,),
+        ).fetchone()
     if unexpected:
         raise RuntimeError(
             f"chunk store contains incompatible version {unexpected[0]}; "
