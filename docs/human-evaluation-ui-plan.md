@@ -358,11 +358,12 @@ incompleta; continúa siendo evaluable.
 
 ## Despliegue previsto
 
-El MVP se ejecutará en la MacBook Pro actual, ligado inicialmente a
-`127.0.0.1:8765`. La UI y el backend se publican como una sola app ASGI. Para
-pruebas humanas remotas se colocará delante un túnel o reverse proxy HTTPS que
-termine TLS, limite cuerpos, no almacene en buffer SSE y use un hostname estable;
-todavía debe elegirse el proveedor.
+La MacBook Pro actual es un entorno de desarrollo y pruebas; no es el servidor
+de producción. El despliegue operativo se hará en la máquina de servidor
+configurada para el proyecto, ligada inicialmente a `127.0.0.1:8765` detrás de
+un túnel o reverse proxy HTTPS que termine TLS, limite cuerpos, no almacene en
+buffer SSE y use un hostname estable. La UI y el backend se publican como una
+sola app ASGI.
 
 Configuración mínima, con valores de ejemplo que no deben guardarse en Git:
 
@@ -504,8 +505,8 @@ La procedencia separa `vector_available` (el artefacto existe en disco) de
 - Air sigue evolucionando y la versión compatible con Python 3.12 no es la más
   reciente. Se debe decidir después del piloto si migrar todo el proyecto a
   Python 3.13, mantener 0.35 o sustituir solo la capa web.
-- Exponer la MacBook requiere elegir túnel/proxy, dominio, supervisor y política
-  de actualización antes de invitar evaluadores.
+- Exponer el servidor de producción requiere elegir túnel/proxy, dominio,
+  supervisor y política de actualización antes de invitar evaluadores.
 - La cola y los leases son persistentes y compartidos entre procesos en un
   nodo. No se debe colocar esta base en un sistema de archivos de red ni usarla
   como coordinador entre varios nodos.

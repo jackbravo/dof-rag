@@ -34,7 +34,13 @@ from human_eval.service import (
     IdempotencyConflictError,
     PublicExecutionError,
 )
-from human_eval.store import SCHEMA_VERSION, EvaluationStore
+from human_eval.store import (
+    SCHEMA_VERSION,
+    ActiveRunConflict,
+    DailyQuotaConflict,
+    EvaluationStore,
+    QueueCapacityConflict,
+)
 from scripts.seed_human_eval_v4_hybrid import SEED_USER, seed_live_run
 
 PROVENANCE = {
@@ -105,6 +111,31 @@ class BlockingExecutor(FakeExecutor):
         if not self.release.wait(timeout=3):
             raise RuntimeError("test timed out")
         return super().execute(request, on_progress=on_progress)
+
+
+class ConcurrentBlockingExecutor(FakeExecutor):
+    def __init__(self):
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.started_count = 0
+
+    def execute(self, request: RunRequest, *, on_progress=None):
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.started_count += 1
+            if self.started_count >= 2:
+                self.started.set()
+        try:
+            if not self.release.wait(timeout=3):
+                raise RuntimeError("test timed out")
+            return super().execute(request, on_progress=on_progress)
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 def wait_for_terminal(service: EvaluationService, run_id: str) -> dict:
@@ -778,6 +809,39 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first["run_id"], second["run_id"])
         self.assertNotEqual(first["run_id"], third["run_id"])
 
+    def test_admission_constraints_are_independent(self):
+        first, _ = self.store.create_run(
+            RunRequest("primera"), user_id="one", provenance=PROVENANCE
+        )
+        with self.assertRaises(ActiveRunConflict):
+            self.store.create_run(
+                RunRequest("segunda"),
+                user_id="one",
+                provenance=PROVENANCE,
+                enforce_active_run=True,
+            )
+        with self.assertRaises(QueueCapacityConflict):
+            self.store.create_run(
+                RunRequest("tercera"),
+                user_id="two",
+                provenance=PROVENANCE,
+                queue_capacity=1,
+            )
+        self.store.create_run(
+            RunRequest("cuarta"),
+            user_id="three",
+            provenance=PROVENANCE,
+        )
+        with self.assertRaises(DailyQuotaConflict):
+            self.store.create_run(
+                RunRequest("quinta"),
+                user_id="three",
+                provenance=PROVENANCE,
+                daily_question_limit=1,
+                daily_since="",
+            )
+        self.assertEqual(self.store.get_run(first["run_id"])["status"], "queued")
+
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
@@ -988,6 +1052,33 @@ class ServiceTests(unittest.TestCase):
             second_executor.release.set()
             first_service.close()
             second_service.close()
+
+    def test_one_service_runs_configured_parallel_workers(self):
+        executor = ConcurrentBlockingExecutor()
+        service = EvaluationService(
+            self.store,
+            executor,
+            executor.provenance,
+            model_concurrency=2,
+            scheduler_workers=2,
+        )
+        service.start()
+        try:
+            first = service.submit(RunRequest("primera"), user_id="one", admin=True)
+            second = service.submit(RunRequest("segunda"), user_id="two", admin=True)
+            self.assertTrue(executor.started.wait(timeout=1))
+            self.assertEqual(executor.max_active, 2)
+            self.assertEqual(self.store.model_activity(2)["active"], 2)
+            executor.release.set()
+            self.assertEqual(
+                wait_for_terminal(service, first["run_id"])["status"], "succeeded"
+            )
+            self.assertEqual(
+                wait_for_terminal(service, second["run_id"])["status"], "succeeded"
+            )
+        finally:
+            executor.release.set()
+            service.close()
 
     def test_close_runs_the_executor_shutdown_hook(self):
         class ClosingExecutor(FakeExecutor):

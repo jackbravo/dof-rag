@@ -35,6 +35,11 @@ class ActiveRunConflict(RuntimeError):
 class QueueCapacityConflict(RuntimeError):
     """The shared persistent queue has reached its configured capacity."""
 
+
+class DailyQuotaConflict(RuntimeError):
+    """The user has reached the configured rolling question limit."""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
@@ -186,8 +191,15 @@ class EvaluationStore:
         *,
         user_id: str,
         provenance: dict[str, Any],
+        enforce_active_run: bool = False,
         queue_capacity: int | None = None,
+        daily_question_limit: int | None = None,
+        daily_since: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if daily_question_limit is not None and daily_question_limit < 1:
+            raise ValueError("daily_question_limit must be positive")
+        if daily_question_limit is not None and daily_since is None:
+            raise ValueError("daily_since is required with daily_question_limit")
         if queue_capacity is not None and queue_capacity < 1:
             raise ValueError("queue_capacity must be positive")
         created_at = utc_now()
@@ -205,7 +217,7 @@ class EvaluationStore:
                     found = self.get_run(existing[0])
                     assert found is not None
                     return found, False
-            if queue_capacity is not None:
+            if enforce_active_run:
                 active = connection.execute(
                     "SELECT 1 FROM runs r JOIN run_events e ON e.run_id = r.run_id "
                     "WHERE r.user_id = ? AND e.sequence = "
@@ -216,6 +228,14 @@ class EvaluationStore:
                 ).fetchone()
                 if active:
                     raise ActiveRunConflict(user_id)
+            if daily_question_limit is not None:
+                submissions = connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE user_id = ? AND created_at >= ?",
+                    (user_id, daily_since),
+                ).fetchone()[0]
+                if int(submissions) >= daily_question_limit:
+                    raise DailyQuotaConflict(daily_question_limit)
+            if queue_capacity is not None:
                 queued = connection.execute(
                     "SELECT COUNT(*) FROM runs r JOIN run_events e ON e.run_id = r.run_id "
                     "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "

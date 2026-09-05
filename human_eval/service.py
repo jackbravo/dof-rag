@@ -13,7 +13,12 @@ from math import ceil
 from typing import Any, Protocol
 
 from .contracts import FeedbackRequest, RunRequest
-from .store import ActiveRunConflict, EvaluationStore, QueueCapacityConflict
+from .store import (
+    ActiveRunConflict,
+    DailyQuotaConflict,
+    EvaluationStore,
+    QueueCapacityConflict,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -182,19 +187,20 @@ class EvaluationService:
             # create_run remain authoritative across web processes.
             if self.store.has_active_run(user_id):
                 raise ActiveRunError("user already has an active run")
+            daily_since: str | None = None
             if not admin:
                 if not self.store.has_review_since_last_submission(user_id):
                     raise ReviewRequiredError(
                         "a published-answer review is required before asking"
                     )
                 if daily_question_limit >= 1:
-                    cutoff = (
+                    daily_since = (
                         (datetime.now(timezone.utc) - timedelta(hours=24))
                         .isoformat()
                         .replace("+00:00", "Z")
                     )
                     if (
-                        self.store.count_submissions_since(user_id, cutoff)
+                        self.store.count_submissions_since(user_id, daily_since)
                         >= daily_question_limit
                     ):
                         raise QuotaExceededError("daily question limit reached")
@@ -208,12 +214,21 @@ class EvaluationService:
                     request,
                     user_id=user_id,
                     provenance=self.provenance_factory(),
+                    enforce_active_run=True,
                     queue_capacity=self.queue.maxsize,
+                    daily_question_limit=(
+                        daily_question_limit
+                        if not admin and daily_question_limit >= 1
+                        else None
+                    ),
+                    daily_since=daily_since,
                 )
             except ActiveRunConflict as exc:
                 raise ActiveRunError("user already has an active run") from exc
             except QueueCapacityConflict as exc:
                 raise QueueFullError("execution queue is full") from exc
+            except DailyQuotaConflict as exc:
+                raise QuotaExceededError("daily question limit reached") from exc
             if created:
                 try:
                     self.queue.put_nowait(run["run_id"])

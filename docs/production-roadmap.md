@@ -173,8 +173,7 @@ HTML que contenga identidad o CSRF.
 
 - **Air/FastAPI, Go o Elixir:** sólo si Air limita middleware, mantenimiento u
   observabilidad. La primera medición no apunta al servidor web.
-- **PostgreSQL:** cuando haya varios procesos o contención comprobada en
-  SQLite.
+- **PostgreSQL:** cuando haya varios nodos o contención comprobada en SQLite.
 - **Redis:** cuando necesitemos pub/sub o caché compartido entre procesos.
 - **Más hardware o una API externa:** cuando conozcamos la capacidad y la cola
   real del equipo disponible.

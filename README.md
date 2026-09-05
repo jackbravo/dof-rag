@@ -177,7 +177,9 @@ uv run python -m human_eval.app  # http://127.0.0.1:8765
 ```
 
 También se puede usar un modelo local mediante un servidor compatible con la
-API de OpenAI. La configuración probada en Apple Silicon usa Qwen3.8-27B con
+API de OpenAI. Los comandos siguientes son ejemplos de desarrollo y benchmark;
+el servidor operativo del proyecto se configura en su propia máquina. La
+configuración probada en Apple Silicon usa Qwen3.8-27B con
 llama.cpp `llama-server`: un solo slot, 32K de contexto y razonamiento
 conservado entre turnos de herramientas.
 
