@@ -660,6 +660,24 @@ class StoreTests(unittest.TestCase):
             self.store.get_run(run["run_id"])["question"], "pregunta conservada"
         )
 
+    def test_schema_three_migration_recovers_unclaimed_started_runs(self):
+        run, _ = self.store.create_run(
+            RunRequest("pregunta interrumpida"),
+            user_id="evaluator",
+            provenance=PROVENANCE,
+        )
+        self.store.append_event(run["run_id"], "started")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'"
+            )
+
+        self.store.initialize()
+
+        recovered = self.store.get_run(run["run_id"])
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["error"]["code"], "service_restarted")
+
     def test_schema_two_is_migrated_with_user_ids_and_publish_columns(self):
         with sqlite3.connect(self.path) as connection:
             connection.executescript(
@@ -871,6 +889,50 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(record["status"], "succeeded")
         self.assertEqual(executor.calls, 2)
 
+    def test_service_start_does_not_recover_a_live_current_schema_seed(self):
+        executor = BlockingExecutor()
+        outcomes: list[str] = []
+        errors: list[BaseException] = []
+
+        def seed() -> None:
+            try:
+                outcomes.append(
+                    seed_live_run(
+                        self.store,
+                        executor,
+                        {"id": "LI-LIVE", "question": "pregunta semilla"},
+                        publish=False,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=seed)
+        thread.start()
+        self.assertTrue(executor.started.wait(timeout=1))
+        service = EvaluationService(
+            self.store, FakeExecutor(), lambda: dict(PROVENANCE)
+        )
+        service.start()
+        try:
+            record = self.store.find_idempotent_run(
+                SEED_USER, "eval-v4-hybrid:LI-LIVE"
+            )
+            self.assertEqual(record["status"], "running")
+            executor.release.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(outcomes, ["created"])
+            finished = self.store.find_idempotent_run(
+                SEED_USER, "eval-v4-hybrid:LI-LIVE"
+            )
+            self.assertEqual(finished["status"], "succeeded")
+        finally:
+            executor.release.set()
+            thread.join(timeout=1)
+            service.close()
+
     def test_client_request_id_is_idempotent_per_evaluator(self):
         request = RunRequest("pregunta válida", client_request_id="same-request")
         first, first_created = self.store.create_run(
@@ -976,6 +1038,27 @@ class StoreTests(unittest.TestCase):
             ).fetchone()[0]
         deadline = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
         self.assertGreater(deadline, lock_released_at)
+
+    def test_expired_lease_cannot_be_resurrected_by_heartbeat(self):
+        self.store.initialize_model_slots(1)
+        run, _ = self.store.create_run(
+            RunRequest("pregunta válida"), user_id="one", provenance=PROVENANCE
+        )
+        self.store.claim_next_run(
+            worker_id="worker-one", concurrency=1, lease_seconds=0.01
+        )
+        time.sleep(0.02)
+
+        renewed = self.store.renew_model_slot(
+            run_id=run["run_id"],
+            slot_id=1,
+            worker_id="worker-one",
+            lease_seconds=60,
+        )
+
+        self.assertFalse(renewed)
+        self.assertEqual(self.store.recover_expired_model_slots(), 1)
+        self.assertEqual(self.store.get_run(run["run_id"])["status"], "failed")
 
     def test_admission_constraints_are_independent(self):
         first, _ = self.store.create_run(
@@ -1501,12 +1584,38 @@ class ServiceTests(unittest.TestCase):
         try:
             with mock.patch.object(
                 self.store,
-                "append_event",
+                "append_terminal_event_if_claimed",
                 side_effect=ValueError("serialization failed"),
             ):
                 with self.assertRaisesRegex(ValueError, "serialization failed"):
-                    service._append_event_if_open("run-id", "succeeded", {})
+                    service._append_event_if_open("run-id", 1, "succeeded", {})
         finally:
+            service.close()
+
+    def test_expired_unreaped_lease_cannot_commit_success(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store,
+            executor,
+            executor.provenance,
+            lease_seconds=0.05,
+        )
+        service.start()
+        try:
+            with mock.patch.object(
+                self.store, "renew_model_slot", return_value=False
+            ):
+                run = service.submit(
+                    RunRequest("pregunta lenta"), user_id="one", admin=True
+                )
+                self.assertTrue(executor.started.wait(timeout=1))
+                time.sleep(0.1)
+                executor.release.set()
+                finished = wait_for_terminal(service, run["run_id"])
+            self.assertEqual(finished["status"], "failed")
+            self.assertEqual(finished["error"]["code"], "service_restarted")
+        finally:
+            executor.release.set()
             service.close()
 
     def test_worker_survives_when_recovery_wins_the_lease_race(self):

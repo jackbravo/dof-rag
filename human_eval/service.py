@@ -18,7 +18,6 @@ from .store import (
     DailyQuotaConflict,
     EvaluationStore,
     IdempotencyPayloadConflict,
-    InvalidRunTransition,
     QueueCapacityConflict,
 )
 
@@ -137,7 +136,6 @@ class EvaluationService:
             self.store.initialize()
             self.store.initialize_model_slots(self.model_concurrency)
             recovered = self.store.recover_expired_model_slots()
-            recovered += self.store.recover_unclaimed_started_runs()
             if recovered:
                 LOGGER.warning("recovered %s interrupted executions", recovered)
             for worker in self.workers:
@@ -399,6 +397,7 @@ class EvaluationService:
                         daemon=True,
                     )
                     heartbeat.start()
+                    terminal_written = False
                     try:
                         try:
                             result = self.executor.execute(
@@ -415,15 +414,17 @@ class EvaluationService:
                                     run_id,
                                     exc.code,
                                 )
-                            self._append_event_if_open(
+                            terminal_written = self._append_event_if_open(
                                 run_id,
+                                slot_id,
                                 "failed",
                                 {"code": exc.code, "message": str(exc)},
                             )
                         except Exception:
                             LOGGER.exception("human-evaluation run %s failed", run_id)
-                            self._append_event_if_open(
+                            terminal_written = self._append_event_if_open(
                                 run_id,
+                                slot_id,
                                 "failed",
                                 {
                                     "code": "internal_error",
@@ -431,11 +432,13 @@ class EvaluationService:
                                 },
                             )
                         else:
-                            self._append_event_if_open(run_id, "succeeded", result)
+                            terminal_written = self._append_event_if_open(
+                                run_id, slot_id, "succeeded", result
+                            )
                     finally:
                         heartbeat_stop.set()
                         heartbeat.join(timeout=1)
-                        if not self._closing.is_set():
+                        if terminal_written and not self._closing.is_set():
                             self.store.release_model_slot(
                                 run_id=run_id,
                                 slot_id=slot_id,
@@ -486,22 +489,25 @@ class EvaluationService:
     def _append_event_if_open(
         self,
         run_id: str,
+        slot_id: int,
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> bool:
         with self._write_lock:
             if self._closing.is_set():
                 return False
-            try:
-                self.store.append_event(run_id, event_type, payload)
-            except InvalidRunTransition:
-                # Another process may have recovered this run after our lease
-                # lapsed (restart, stalled heartbeat) and written a terminal
-                # event. That terminal event wins: drop our late result and
-                # keep the worker alive instead of dying on the rejected
-                # transition.
+            appended = self.store.append_terminal_event_if_claimed(
+                run_id,
+                event_type,
+                payload,
+                slot_id=slot_id,
+                worker_id=self.worker_id,
+            )
+            if not appended:
                 LOGGER.warning(
-                    "run %s already terminal; dropping %s event", run_id, event_type
+                    "run %s no longer owns a live model claim; dropping %s event",
+                    run_id,
+                    event_type,
                 )
                 return False
             return True

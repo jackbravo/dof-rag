@@ -157,11 +157,26 @@ class EvaluationStore:
                 )
             connection.executescript(SCHEMA)
             self._migrate_columns(connection)
+            # executescript may commit while creating missing tables. Re-enter
+            # a write transaction and re-read the version so only one process
+            # performs v4 orphan recovery during a concurrent deployment.
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            migration_version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if migration_version and migration_version[0] != SCHEMA_VERSION:
+                # Only schema migration can identify these as pre-v4 runs.
+                # In schema v4, supported maintenance jobs may intentionally
+                # execute a started run without participating in model_slots.
+                self._recover_unclaimed_started_runs_in_connection(
+                    connection, utc_now()
+                )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?, ?)",
                 ("schema_version", SCHEMA_VERSION),
             )
-            if current and current[0] != SCHEMA_VERSION:
+            if migration_version and migration_version[0] != SCHEMA_VERSION:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -391,11 +406,12 @@ class EvaluationStore:
             connection.execute("BEGIN IMMEDIATE")
             # Calculate under the write lock so lock contention cannot consume
             # some or all of the renewed lease before the UPDATE commits.
+            now = utc_now()
             lease_until = self._lease_until(lease_seconds)
             cursor = connection.execute(
                 "UPDATE model_slots SET lease_until = ? WHERE slot_id = ? "
-                "AND run_id = ? AND worker_id = ?",
-                (lease_until, slot_id, run_id, worker_id),
+                "AND run_id = ? AND worker_id = ? AND lease_until > ?",
+                (lease_until, slot_id, run_id, worker_id, now),
             )
         return cursor.rowcount == 1
 
@@ -467,36 +483,36 @@ class EvaluationStore:
                 connection, utc_now()
             )
 
-    def recover_unclaimed_started_runs(self) -> int:
-        """Recover pre-v4 started runs that have no scheduler lease."""
-        now = utc_now()
+    @staticmethod
+    def _recover_unclaimed_started_runs_in_connection(
+        connection: sqlite3.Connection, now: str
+    ) -> int:
+        """Fail legacy started runs while upgrading a pre-v4 database."""
         recovered = 0
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            runs = connection.execute(
-                "SELECT r.run_id, e.sequence FROM runs r JOIN run_events e "
-                "ON e.run_id = r.run_id WHERE e.sequence = (SELECT MAX(e2.sequence) "
-                "FROM run_events e2 WHERE e2.run_id = r.run_id) "
-                "AND e.event_type = 'started' AND NOT EXISTS ("
-                "SELECT 1 FROM model_slots s WHERE s.run_id = r.run_id)"
-            ).fetchall()
-            for run in runs:
-                connection.execute(
-                    "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
-                    "VALUES (?, ?, 'failed', ?, ?)",
-                    (
-                        str(run[0]),
-                        int(run[1]) + 1,
-                        now,
-                        _json(
-                            {
-                                "code": "service_restarted",
-                                "message": "La ejecución se interrumpió antes de terminar.",
-                            }
-                        ),
+        runs = connection.execute(
+            "SELECT r.run_id, e.sequence FROM runs r JOIN run_events e "
+            "ON e.run_id = r.run_id WHERE e.sequence = (SELECT MAX(e2.sequence) "
+            "FROM run_events e2 WHERE e2.run_id = r.run_id) "
+            "AND e.event_type = 'started' AND NOT EXISTS ("
+            "SELECT 1 FROM model_slots s WHERE s.run_id = r.run_id)"
+        ).fetchall()
+        for run in runs:
+            connection.execute(
+                "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                "VALUES (?, ?, 'failed', ?, ?)",
+                (
+                    str(run[0]),
+                    int(run[1]) + 1,
+                    now,
+                    _json(
+                        {
+                            "code": "service_restarted",
+                            "message": "La ejecución se interrumpió antes de terminar.",
+                        }
                     ),
-                )
-                recovered += 1
+                ),
+            )
+            recovered += 1
         return recovered
 
     def find_idempotent_run(
@@ -820,6 +836,48 @@ class EvaluationStore:
                     _json(payload or {}),
                 ),
             )
+
+    def append_terminal_event_if_claimed(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None,
+        *,
+        slot_id: int,
+        worker_id: str,
+    ) -> bool:
+        """Persist a terminal result only for a live, owned model claim."""
+        if event_type not in TERMINAL_STATES:
+            raise ValueError(f"invalid terminal event type: {event_type}")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            created_at = utc_now()
+            current = connection.execute(
+                "SELECT event_type, sequence FROM run_events WHERE run_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(run_id)
+            claimed = connection.execute(
+                "SELECT 1 FROM model_slots WHERE slot_id = ? AND run_id = ? "
+                "AND worker_id = ? AND lease_until > ?",
+                (slot_id, run_id, worker_id, created_at),
+            ).fetchone()
+            if current["event_type"] != "started" or claimed is None:
+                return False
+            connection.execute(
+                "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    int(current["sequence"]) + 1,
+                    event_type,
+                    created_at,
+                    _json(payload or {}),
+                ),
+            )
+        return True
 
     def append_progress(
         self, run_id: str, event_type: str, payload: dict[str, Any]
