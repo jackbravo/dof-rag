@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily DOF corpus update at 05:30 local time
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
