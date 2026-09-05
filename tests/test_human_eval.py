@@ -1069,6 +1069,44 @@ class ServiceTests(unittest.TestCase):
         finally:
             replacement.close()
 
+    def test_worker_survives_when_recovery_wins_the_lease_race(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store,
+            executor,
+            executor.provenance,
+            lease_seconds=30,
+        )
+        service.start()
+        try:
+            run = service.submit(RunRequest("primera"), user_id="one", admin=True)
+            self.assertTrue(executor.started.wait(timeout=1))
+            # Another process recovers the run while this worker is still
+            # executing it (lease expired during a stalled heartbeat).
+            self.assertEqual(self.store.expire_model_leases(service.worker_id), 1)
+            self.assertEqual(self.store.recover_expired_model_slots(), 1)
+            executor.release.set()
+            # The worker finishes, drops its late 'succeeded' result and
+            # keeps serving: the terminal recovery event wins.
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if self.store.model_activity(1)["active"] == 0:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("worker did not release the recovered run's slot")
+            recovered = service.public_run(run["run_id"], admin=True)
+            self.assertEqual(recovered["status"], "failed")
+            self.assertEqual(recovered["error"]["code"], "service_restarted")
+            self.assertTrue(service.worker.is_alive())
+            follow_up = service.submit(RunRequest("segunda"), user_id="one", admin=True)
+            self.assertEqual(
+                wait_for_terminal(service, follow_up["run_id"])["status"],
+                "succeeded",
+            )
+        finally:
+            service.close()
+
 
 class AirAppTestCase(unittest.TestCase):
     daily_question_limit = 50

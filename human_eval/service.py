@@ -442,7 +442,18 @@ class EvaluationService:
         with self._write_lock:
             if self._closing.is_set():
                 return False
-            self.store.append_event(run_id, event_type, payload)
+            try:
+                self.store.append_event(run_id, event_type, payload)
+            except ValueError:
+                # Another process may have recovered this run after our lease
+                # lapsed (restart, stalled heartbeat) and written a terminal
+                # event. That terminal event wins: drop our late result and
+                # keep the worker alive instead of dying on the rejected
+                # transition.
+                LOGGER.warning(
+                    "run %s already terminal; dropping %s event", run_id, event_type
+                )
+                return False
             return True
 
     def _append_progress_if_open(

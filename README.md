@@ -226,6 +226,12 @@ uv run python -m human_eval.app
   con `uv run python -m human_eval.app --workers 4`. Todos deben usar el mismo
   `DOF_HUMAN_EVAL_DB`; SQLite en modo WAL coordina la cola y los leases, y el
   límite global sigue siendo `DOF_MODEL_CONCURRENCY`, no cuatro veces ese valor.
+- Todos los procesos web que comparten la base deben usar **la misma
+  configuración de scheduler**: `DOF_MODEL_CONCURRENCY`, `DOF_QUEUE_CAPACITY` y
+  `DOF_MODEL_LEASE_SECONDS`. El scheduler no valida que coincidan: cada proceso
+  aplica sus propios valores al reclamar slots y admitir preguntas, así que si
+  difieren, el límite efectivo global es el mayor de ellos (y las estimaciones
+  de espera y la capacidad de cola se vuelven inconsistentes entre procesos).
 - Con varios procesos web, ejecuta el servidor de embeddings una sola vez y
   configura `DOF_MANAGE_EMBED_SERVER=false` en la aplicación. Por ejemplo:
   `llama-server -m ~/dof-gguf/jina-v5-small-retrieval-F16.gguf --embedding
