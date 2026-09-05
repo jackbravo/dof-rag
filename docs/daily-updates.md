@@ -1,9 +1,11 @@
-# Daily DOF updates on macOS
+# Daily DOF updates
 
-The production corpus is updated by the macOS `launchd` job
-`com.jackbravo.dof-rag-daily`. It runs at 05:30 local time and once whenever
-the job is loaded. `launchd` is used instead of Unix cron because it is the
-native macOS scheduler and runs a missed calendar job after the Mac wakes.
+In production the corpus is updated automatically once per day: on macOS by
+the `launchd` job `com.jackbravo.dof-rag-daily`, on Linux by the systemd user
+timer `dof-rag-daily.timer`. Both run at 05:30 local time and catch up on
+missed runs (launchd refires after the Mac wakes; the timer uses
+`Persistent=true`). `launchd`/`systemd` are used instead of Unix cron because
+they are the native schedulers.
 
 ## What each run does
 
@@ -114,3 +116,34 @@ and new chunk recipes in live retrieval indexes.
 The daily pipeline is intentionally append-only. Replacing an already ingested
 path or repairing historical corpus rows is an offline migration and must
 rebuild or explicitly reconcile the affected derived indexes.
+
+## systemd operations (Linux)
+
+Install or reload the timer (renders the checkout path into the unit template,
+then enables and starts the timer):
+
+```bash
+scripts/install_dof_systemd.sh
+```
+
+The checked-in template units are `ops/systemd/dof-rag-daily.service` and
+`ops/systemd/dof-rag-daily.timer`; the installed rendered copies live in
+`~/.config/systemd/user/`. Re-run the installer after moving the repository.
+The runner `scripts/run_dof_daily_linux.sh` accepts the same arguments as the
+macOS runner, e.g. `scripts/run_dof_daily_linux.sh --dry-run`.
+
+Inspect and operate:
+
+```bash
+systemctl --user list-timers dof-rag-daily.timer
+journalctl --user -u dof-rag-daily.service -e
+tail -f logs/dof-daily.log logs/dof-daily.error.log
+systemctl --user start dof-rag-daily.service   # extra run; the overlap lock applies
+systemctl --user disable --now dof-rag-daily.timer
+```
+
+Enable lingering so the timer fires without an open session:
+
+```bash
+loginctl enable-linger $USER
+```

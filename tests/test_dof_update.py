@@ -1,4 +1,5 @@
 import plistlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -294,6 +295,7 @@ class DailyUpdateTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv):
             build_fts_full.main()
 
+    @unittest.skipUnless(shutil.which("zsh"), "launchd installer requires zsh (macOS)")
     def test_launchd_renderer_preserves_special_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

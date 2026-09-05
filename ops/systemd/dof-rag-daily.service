@@ -6,7 +6,6 @@ After=network-online.target
 [Service]
 Type=oneshot
 Nice=10
-Environment=DOF_REPO_DIR=%h/Documents/dof/dof-rag
-ExecStart=%h/Documents/dof/dof-rag/scripts/run_dof_daily_linux.sh
-StandardOutput=append:%h/Documents/dof/dof-rag/logs/dof-daily.log
-StandardError=append:%h/Documents/dof/dof-rag/logs/dof-daily.error.log
+ExecStart=@DOF_REPO_DIR@/scripts/run_dof_daily_linux.sh
+StandardOutput=append:@DOF_REPO_DIR@/logs/dof-daily.log
+StandardError=append:@DOF_REPO_DIR@/logs/dof-daily.error.log
