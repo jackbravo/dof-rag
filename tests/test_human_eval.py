@@ -20,10 +20,12 @@ from human_eval.agent_executor import (
     _public_result,
 )
 from human_eval.app import (
+    STREAM_SCRIPT,
     WebSettings,
     _attach_chunk_html,
     _progress_chunk_html,
     _progress_timeline,
+    _queue_status_event,
     _sanitize_login_next,
     create_app,
 )
@@ -678,6 +680,27 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "failed")
         self.assertEqual(recovered["error"]["code"], "service_restarted")
 
+    def test_schema_migration_holds_the_sqlite_write_lock(self):
+        original = EvaluationStore._migrate_columns
+        observed_transaction: list[bool] = []
+
+        def inspect_lock(connection: sqlite3.Connection) -> None:
+            observed_transaction.append(connection.in_transaction)
+            probe = sqlite3.connect(self.path, timeout=0)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    probe.execute("BEGIN IMMEDIATE")
+            finally:
+                probe.close()
+            original(connection)
+
+        with mock.patch.object(
+            EvaluationStore, "_migrate_columns", side_effect=inspect_lock
+        ):
+            self.store.initialize()
+
+        self.assertEqual(observed_transaction, [True])
+
     def test_schema_two_is_migrated_with_user_ids_and_publish_columns(self):
         with sqlite3.connect(self.path) as connection:
             connection.executescript(
@@ -1286,6 +1309,19 @@ class ServiceTests(unittest.TestCase):
             executor.release.set()
             service.close()
 
+    def test_queue_retry_after_estimates_the_next_completion(self):
+        service = EvaluationService(
+            self.store, FakeExecutor(), lambda: dict(PROVENANCE)
+        )
+        with (
+            mock.patch.object(
+                self.store, "recent_durations", return_value=[120.0, 180.0]
+            ),
+            mock.patch.object(self.store, "queue_depth", return_value=20) as depth,
+        ):
+            self.assertEqual(service.queue_retry_after(), 150)
+        depth.assert_not_called()
+
     def test_queue_full_rejection_is_logged(self):
         executor = BlockingExecutor()
         service = EvaluationService(
@@ -1659,6 +1695,24 @@ class ServiceTests(unittest.TestCase):
 
 
 class AppMainTests(unittest.TestCase):
+    def test_queue_status_event_requires_one_complete_snapshot(self):
+        self.assertIsNone(_queue_status_event({"status": "queued"}))
+        queue_event = _queue_status_event(
+            {
+                "status": "queued",
+                "queue_position": 2,
+                "estimated_wait_seconds": 600,
+                "queue_snapshot": {"active": 1, "capacity": 2},
+            }
+        )
+        self.assertEqual(queue_event[0], (2, 1, 2))
+        self.assertIn("Posición en la cola: 2", queue_event[1])
+        self.assertNotIn("Posición en la cola: 0", queue_event[1])
+
+    def test_stream_clears_stale_queue_status_when_work_starts(self):
+        self.assertIn("if (queueStatus) queueStatus.remove();", STREAM_SCRIPT)
+        self.assertIn("source.addEventListener('running'", STREAM_SCRIPT)
+
     def test_multi_worker_server_honors_configured_host_and_port(self):
         env = {
             "DOF_SESSION_SECRET": "test-session-secret-that-is-at-least-32-bytes",

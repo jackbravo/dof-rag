@@ -452,6 +452,10 @@ STREAM_SCRIPT = """
     if (!streamUrl) return;
     const list = node.querySelector('[data-progress-list]');
     const state = node.querySelector('[data-stream-state]');
+    const clearQueueStatus = () => {
+      const queueStatus = node.querySelector('[data-queue-status]');
+      if (queueStatus) queueStatus.remove();
+    };
     let last = Number(node.dataset.lastEventId || 0);
     if (!window.EventSource) {
       state.textContent = 'Actualizando el estado…';
@@ -466,8 +470,13 @@ STREAM_SCRIPT = """
       const event = JSON.parse(message.data);
       last = Math.max(last, Number(event.sequence || 0));
       node.dataset.lastEventId = last;
+      clearQueueStatus();
       appendProgress(list, event);
       state.textContent = 'Recibiendo actividad en vivo';
+    });
+    source.addEventListener('running', () => {
+      clearQueueStatus();
+      state.textContent = 'El modelo está procesando la pregunta';
     });
     source.addEventListener('queue', (message) => {
       const event = JSON.parse(message.data);
@@ -864,6 +873,30 @@ def _attach_chunk_html(event: dict[str, Any]) -> None:
         excerpt = chunk.get("excerpt") or chunk.get("snippet") or ""
         if excerpt:
             chunk["excerpt_html"] = render_markdown_html(excerpt)
+
+
+def _queue_status_event(
+    run: dict[str, Any],
+) -> tuple[tuple[int, int, int], str] | None:
+    """Build a queue update only from one complete public-run snapshot."""
+    if run.get("status") != "queued":
+        return None
+    position = run.get("queue_position")
+    snapshot = run.get("queue_snapshot", {})
+    active = snapshot.get("active")
+    capacity = snapshot.get("capacity")
+    if position is None or active is None or capacity is None:
+        return None
+    queue_state = (int(position), int(active), int(capacity))
+    wait_minutes = max(
+        1, round((run.get("estimated_wait_seconds") or 60) / 60)
+    )
+    message = (
+        f"Posición en la cola: {queue_state[0]} · "
+        f"Espera aproximada: {wait_minutes} min · "
+        f"{queue_state[1]} de {queue_state[2]} slots ocupados"
+    )
+    return queue_state, message
 
 
 def _feedback_form(run_id: str, csrf_token: str, *, next_url: str) -> str:
@@ -1437,6 +1470,7 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
             cursor = after
             heartbeat_at = time.monotonic()
             last_queue_state: tuple[int, int, int] | None = None
+            running_announced = False
             while True:
                 events = await asyncio.to_thread(
                     service.store.progress_for_run, run_id, after=cursor
@@ -1451,24 +1485,18 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
                     service.public_run, run_id, user_id=user.id, admin=True
                 )
                 if run["status"] == "queued":
-                    snapshot = run.get("queue_snapshot", {})
-                    queue_state = (
-                        int(run.get("queue_position") or 0),
-                        int(snapshot.get("active") or 0),
-                        int(snapshot.get("capacity") or 0),
-                    )
-                    if queue_state != last_queue_state:
-                        last_queue_state = queue_state
-                        message = (
-                            f"Posición en la cola: {queue_state[0]} · "
-                            f"Espera aproximada: "
-                            f"{max(1, round((run.get('estimated_wait_seconds') or 60) / 60))} min · "
-                            f"{queue_state[1]} de {queue_state[2]} slots ocupados"
-                        )
-                        yield (
-                            "event: queue\n"
-                            f"data: {json.dumps({'message': message}, ensure_ascii=False)}\n\n"
-                        )
+                    queue_event = _queue_status_event(run)
+                    if queue_event is not None:
+                        queue_state, message = queue_event
+                        if queue_state != last_queue_state:
+                            last_queue_state = queue_state
+                            yield (
+                                "event: queue\n"
+                                f"data: {json.dumps({'message': message}, ensure_ascii=False)}\n\n"
+                            )
+                elif run["status"] == "running" and not running_announced:
+                    running_announced = True
+                    yield 'event: running\ndata: {"status":"running"}\n\n'
                 if run["status"] not in ACTIVE_STATES:
                     data = json.dumps({"status": run["status"]}, separators=(",", ":"))
                     yield f"event: terminal\ndata: {data}\n\n"

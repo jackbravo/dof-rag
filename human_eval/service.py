@@ -321,14 +321,12 @@ class EvaluationService:
         return max(1, int(round(batches * average)))
 
     def queue_retry_after(self) -> int:
-        """Seconds a client should wait before retrying a full queue."""
+        """Estimate when the next completion should free one queue place."""
         durations = self.store.recent_durations(limit=10)
         average = (
             sum(durations) / len(durations) if durations else DEFAULT_RUN_SECONDS
         )
-        depth = max(self.store.queue_depth(), 1)
-        batches = ceil(depth / self.model_concurrency)
-        return max(60, int(round(batches * average)))
+        return max(60, int(round(average)))
 
     def queue_snapshot(self) -> dict[str, int]:
         """Return shared queue state for the status UI and health endpoints."""

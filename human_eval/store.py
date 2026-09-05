@@ -148,6 +148,11 @@ class EvaluationStore:
                 "CREATE TABLE IF NOT EXISTS schema_meta ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            connection.commit()
+            # Uvicorn factory workers can initialize concurrently. Hold the
+            # write lock from version inspection through every schema change
+            # so no worker acts on stale pre-migration column metadata.
+            connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -155,17 +160,9 @@ class EvaluationStore:
                 raise RuntimeError(
                     f"unsupported evaluation schema {current[0]!r}; expected {SCHEMA_VERSION}"
                 )
-            connection.executescript(SCHEMA)
+            self._execute_schema(connection)
             self._migrate_columns(connection)
-            # executescript may commit while creating missing tables. Re-enter
-            # a write transaction and re-read the version so only one process
-            # performs v4 orphan recovery during a concurrent deployment.
-            connection.commit()
-            connection.execute("BEGIN IMMEDIATE")
-            migration_version = connection.execute(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-            ).fetchone()
-            if migration_version and migration_version[0] != SCHEMA_VERSION:
+            if current and current[0] != SCHEMA_VERSION:
                 # Only schema migration can identify these as pre-v4 runs.
                 # In schema v4, supported maintenance jobs may intentionally
                 # execute a started run without participating in model_slots.
@@ -176,12 +173,25 @@ class EvaluationStore:
                 "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?, ?)",
                 ("schema_version", SCHEMA_VERSION),
             )
-            if migration_version and migration_version[0] != SCHEMA_VERSION:
+            if current and current[0] != SCHEMA_VERSION:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
             connection.execute("PRAGMA optimize")
+
+    @staticmethod
+    def _execute_schema(connection: sqlite3.Connection) -> None:
+        """Execute the schema without the implicit commit from executescript."""
+        statement = ""
+        for line in SCHEMA.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                if statement.strip():
+                    connection.execute(statement)
+                statement = ""
+        if statement.strip():
+            raise RuntimeError("incomplete SQLite schema statement")
 
     @staticmethod
     def _migrate_columns(connection: sqlite3.Connection) -> None:
