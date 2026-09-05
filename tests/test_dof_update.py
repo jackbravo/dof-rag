@@ -81,13 +81,29 @@ class DailyUpdateTests(unittest.TestCase):
             is_valid_word_payload(b'\xef\xbb\xbf{"error":true}' + b"x" * 1024)
         )
 
-    def test_sidof_listing_requires_requested_edition_tab(self):
+    def test_sidof_listing_accepts_dated_shell_with_either_notices_tab(self):
         html = (
             "<html><head><title>Diario Oficial de la Federación</title></head>"
             "<body><div id='resp-tab3'>26-08-2026</div></body></html>"
         )
-        self.assertTrue(is_valid_sidof_listing(html, "26", "08", "2026", "MAT"))
-        self.assertFalse(is_valid_sidof_listing(html, "26", "08", "2026", "VES"))
+        self.assertTrue(is_valid_sidof_listing(html, "26", "08", "2026"))
+
+    def test_sidof_listing_rejects_pages_without_the_publication_shell(self):
+        no_tabs = (
+            "<html><head><title>Diario Oficial de la Federación</title></head>"
+            "<body>26-08-2026</body></html>"
+        )
+        wrong_title = (
+            "<html><head><title>Error</title></head>"
+            "<body><div id='resp-tab3'>26-08-2026</div></body></html>"
+        )
+        wrong_date = (
+            "<html><head><title>Diario Oficial de la Federación</title></head>"
+            "<body><div id='resp-tab3'>25-08-2026</div></body></html>"
+        )
+        self.assertFalse(is_valid_sidof_listing(no_tabs, "26", "08", "2026"))
+        self.assertFalse(is_valid_sidof_listing(wrong_title, "26", "08", "2026"))
+        self.assertFalse(is_valid_sidof_listing(wrong_date, "26", "08", "2026"))
 
     def test_conversion_scan_is_limited_to_active_date_window(self):
         with tempfile.TemporaryDirectory() as temporary:

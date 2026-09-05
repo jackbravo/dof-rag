@@ -176,17 +176,24 @@ def is_valid_dof_listing(
 
 
 def is_valid_sidof_listing(
-    html_content: str, day: str, month: str, year: str, edition: str
+    html_content: str, day: str, month: str, year: str
 ) -> bool:
-    """Require the dated SIDOF publication shell before accepting no notices."""
+    """Require the dated SIDOF publication shell before accepting no notices.
+
+    The listing page is edition-agnostic (edition filtering happens during
+    notice extraction). Either notices tab may be absent on normal days, so
+    the presence of either one (plus title and date) proves the real page.
+    """
     soup = BeautifulSoup(html_content, "html.parser")
     title = soup.title.get_text(" ", strip=True).casefold() if soup.title else ""
     if "diario oficial de la federación" not in title:
         return False
     if f"{day}-{month}-{year}" not in html_content:
         return False
-    expected_tab = {"VES": "resp-tab2", "MAT": "resp-tab3"}.get(edition)
-    return expected_tab is not None and soup.find(id=expected_tab) is not None
+    return (
+        soup.find(id="resp-tab2") is not None
+        or soup.find(id="resp-tab3") is not None
+    )
 
 
 def _download_file(session: requests.Session, url: str, output_path: Path, file_type: str = "file") -> bool:
@@ -321,7 +328,7 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
         response = session.get(sidof_url, timeout=30)
         response.raise_for_status()
 
-        if not is_valid_sidof_listing(response.text, day, month, year, edition):
+        if not is_valid_sidof_listing(response.text, day, month, year):
             ERROR_COUNT += 1
             logging.error(
                 f"SIDOF returned an unrecognized listing for "
