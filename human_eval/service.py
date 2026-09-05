@@ -17,6 +17,7 @@ from .store import (
     ActiveRunConflict,
     DailyQuotaConflict,
     EvaluationStore,
+    IdempotencyPayloadConflict,
     InvalidRunTransition,
     QueueCapacityConflict,
 )
@@ -122,6 +123,8 @@ class EvaluationService:
         self._write_lock = threading.Lock()
         self._executor_close_lock = threading.Lock()
         self._executor_closed = False
+        self._worker_count_lock = threading.Lock()
+        self._active_worker_count = len(self.workers)
         self._started = False
 
     def start(self) -> None:
@@ -251,6 +254,10 @@ class EvaluationService:
                 raise QueueFullError("execution queue is full") from exc
             except DailyQuotaConflict as exc:
                 raise QuotaExceededError("daily question limit reached") from exc
+            except IdempotencyPayloadConflict as exc:
+                raise IdempotencyConflictError(
+                    "client_request_id was already used for a different request"
+                ) from exc
             if created:
                 try:
                     self.queue.put_nowait(run["run_id"])
@@ -398,7 +405,7 @@ class EvaluationService:
                                 request,
                                 on_progress=lambda event_type,
                                 payload: self._append_progress_if_open(
-                                    run_id, event_type, payload
+                                    run_id, slot_id, event_type, payload
                                 ),
                             )
                         except PublicExecutionError as exc:
@@ -438,16 +445,18 @@ class EvaluationService:
                     if notification != "__poll__":
                         self.queue.task_done()
         finally:
-            if self._closing.is_set() and not any(
-                worker.is_alive() and worker is not threading.current_thread()
-                for worker in self.workers
-            ):
+            with self._worker_count_lock:
+                self._active_worker_count -= 1
+                close_executor = (
+                    self._closing.is_set() and self._active_worker_count == 0
+                )
+            if close_executor:
                 self._close_executor()
 
     def _lease_heartbeat(
         self, stop: threading.Event, run_id: str, slot_id: int
     ) -> None:
-        interval = max(self.lease_seconds / 3, 0.1)
+        interval = self.lease_seconds / 3
         while not stop.wait(interval):
             if self._closing.is_set():
                 return
@@ -498,7 +507,11 @@ class EvaluationService:
             return True
 
     def _append_progress_if_open(
-        self, run_id: str, event_type: str, payload: dict[str, Any]
+        self,
+        run_id: str,
+        slot_id: int,
+        event_type: str,
+        payload: dict[str, Any],
     ) -> None:
         with self._write_lock:
             if self._closing.is_set():
@@ -508,4 +521,17 @@ class EvaluationService:
                     run_id,
                 )
                 return
-            self.store.append_progress(run_id, event_type, payload)
+            appended = self.store.append_progress_if_claimed(
+                run_id,
+                event_type,
+                payload,
+                slot_id=slot_id,
+                worker_id=self.worker_id,
+            )
+            if appended is None:
+                LOGGER.warning(
+                    "run %s no longer owns model slot %s; dropping %s progress event",
+                    run_id,
+                    slot_id,
+                    event_type,
+                )

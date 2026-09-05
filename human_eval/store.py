@@ -40,6 +40,10 @@ class DailyQuotaConflict(RuntimeError):
     """The user has reached the configured rolling question limit."""
 
 
+class IdempotencyPayloadConflict(RuntimeError):
+    """An idempotency key was reused for a different request payload."""
+
+
 class InvalidRunTransition(ValueError):
     """A run event lost a race with an already-written terminal event."""
 
@@ -212,13 +216,22 @@ class EvaluationStore:
             connection.execute("BEGIN IMMEDIATE")
             if request.client_request_id:
                 existing = connection.execute(
-                    "SELECT run_id FROM runs WHERE user_id = ? "
+                    "SELECT run_id, question, as_of, required_hops FROM runs "
+                    "WHERE user_id = ? "
                     "AND client_request_id = ?",
                     (user_id, request.client_request_id),
                 ).fetchone()
                 if existing:
+                    if any(
+                        (
+                            existing["question"] != request.question,
+                            existing["as_of"] != request.as_of,
+                            existing["required_hops"] != request.required_hops,
+                        )
+                    ):
+                        raise IdempotencyPayloadConflict(request.client_request_id)
                     connection.commit()
-                    found = self.get_run(existing[0])
+                    found = self.get_run(existing["run_id"])
                     assert found is not None
                     return found, False
             if enforce_active_run:
@@ -318,10 +331,12 @@ class EvaluationStore:
         """Atomically claim the oldest queued run and one model slot."""
         if concurrency < 1 or lease_seconds <= 0:
             raise ValueError("invalid scheduler limits")
-        now = utc_now()
-        lease_until = self._lease_until(lease_seconds)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # A busy SQLite writer may have delayed this transaction. Start
+            # the lease only after the write lock is actually ours.
+            now = utc_now()
+            lease_until = self._lease_until(lease_seconds)
             # A replacement worker often starts before the dead worker's lease
             # expires. Reap on every claim attempt as well as at startup so the
             # slot becomes available once its deadline actually passes.
@@ -373,10 +388,14 @@ class EvaluationStore:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # Calculate under the write lock so lock contention cannot consume
+            # some or all of the renewed lease before the UPDATE commits.
+            lease_until = self._lease_until(lease_seconds)
             cursor = connection.execute(
                 "UPDATE model_slots SET lease_until = ? WHERE slot_id = ? "
                 "AND run_id = ? AND worker_id = ?",
-                (self._lease_until(lease_seconds), slot_id, run_id, worker_id),
+                (lease_until, slot_id, run_id, worker_id),
             )
         return cursor.rowcount == 1
 
@@ -815,6 +834,49 @@ class EvaluationStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(run_id)
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_progress "
+                "WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            sequence = int(row[0])
+            connection.execute(
+                "INSERT INTO run_progress(run_id, sequence, event_type, created_at, "
+                "payload_json) VALUES (?, ?, ?, ?, ?)",
+                (run_id, sequence, event_type, created_at, _json(payload)),
+            )
+        return {
+            "sequence": sequence,
+            "event_type": event_type,
+            "created_at": created_at,
+            "payload": payload,
+        }
+
+    def append_progress_if_claimed(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        slot_id: int,
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        """Append progress only while this worker owns a live started claim."""
+        if event_type not in PROGRESS_EVENT_TYPES:
+            raise ValueError(f"invalid progress event type: {event_type}")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            created_at = utc_now()
+            claimed = connection.execute(
+                "SELECT 1 FROM model_slots s WHERE s.slot_id = ? "
+                "AND s.run_id = ? AND s.worker_id = ? AND s.lease_until > ? "
+                "AND EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = ? "
+                "AND e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                "WHERE e2.run_id = e.run_id) AND e.event_type = 'started')",
+                (slot_id, run_id, worker_id, created_at, run_id),
+            ).fetchone()
+            if claimed is None:
+                return None
             row = connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_progress "
                 "WHERE run_id = ?",

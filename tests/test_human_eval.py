@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -44,6 +45,7 @@ from human_eval.store import (
     ActiveRunConflict,
     DailyQuotaConflict,
     EvaluationStore,
+    IdempotencyPayloadConflict,
     QueueCapacityConflict,
 )
 from scripts.seed_human_eval_v4_hybrid import SEED_USER, seed_live_run
@@ -601,6 +603,38 @@ class StoreTests(unittest.TestCase):
             "model_turn_started",
         )
 
+    def test_claimed_progress_requires_a_live_owned_slot(self):
+        self.store.initialize_model_slots(1)
+        run, _ = self.store.create_run(
+            RunRequest("pregunta válida"),
+            user_id="evaluator",
+            provenance=PROVENANCE,
+        )
+        claim = self.store.claim_next_run(
+            worker_id="worker-one", concurrency=1, lease_seconds=60
+        )
+        self.assertEqual(claim, (run["run_id"], 1))
+        appended = self.store.append_progress_if_claimed(
+            run["run_id"],
+            "agent_started",
+            {"message": "inicio"},
+            slot_id=1,
+            worker_id="worker-one",
+        )
+        self.assertIsNotNone(appended)
+
+        self.assertEqual(self.store.expire_model_leases("worker-one"), 1)
+        self.assertEqual(self.store.recover_expired_model_slots(), 1)
+        dropped = self.store.append_progress_if_claimed(
+            run["run_id"],
+            "model_turn_started",
+            {"turn": 2},
+            slot_id=1,
+            worker_id="worker-one",
+        )
+        self.assertIsNone(dropped)
+        self.assertEqual(len(self.store.progress_for_run(run["run_id"])), 1)
+
     def test_schema_one_is_migrated_without_losing_runs(self):
         run, _ = self.store.create_run(
             RunRequest("pregunta conservada"),
@@ -854,6 +888,95 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first["run_id"], second["run_id"])
         self.assertNotEqual(first["run_id"], third["run_id"])
 
+    def test_idempotency_payload_is_validated_inside_create_transaction(self):
+        self.store.create_run(
+            RunRequest("pregunta original", client_request_id="same-request"),
+            user_id="one",
+            provenance=PROVENANCE,
+        )
+        with self.assertRaises(IdempotencyPayloadConflict):
+            self.store.create_run(
+                RunRequest("pregunta diferente", client_request_id="same-request"),
+                user_id="one",
+                provenance=PROVENANCE,
+            )
+
+    def test_claim_lease_starts_after_waiting_for_sqlite_write_lock(self):
+        self.store.initialize_model_slots(1)
+        run, _ = self.store.create_run(
+            RunRequest("pregunta válida"), user_id="one", provenance=PROVENANCE
+        )
+        blocker = sqlite3.connect(self.path)
+        blocker.execute("BEGIN IMMEDIATE")
+        result: list[tuple[str, int] | None] = []
+        started = threading.Event()
+
+        def claim() -> None:
+            started.set()
+            result.append(
+                self.store.claim_next_run(
+                    worker_id="worker-one", concurrency=1, lease_seconds=0.1
+                )
+            )
+
+        thread = threading.Thread(target=claim)
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        time.sleep(0.2)
+        lock_released_at = datetime.now(timezone.utc)
+        blocker.commit()
+        blocker.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [(run["run_id"], 1)])
+        with sqlite3.connect(self.path) as connection:
+            lease_until = connection.execute(
+                "SELECT lease_until FROM model_slots WHERE slot_id = 1"
+            ).fetchone()[0]
+        deadline = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+        self.assertGreater(deadline, lock_released_at)
+
+    def test_renewed_lease_starts_after_waiting_for_sqlite_write_lock(self):
+        self.store.initialize_model_slots(1)
+        run, _ = self.store.create_run(
+            RunRequest("pregunta válida"), user_id="one", provenance=PROVENANCE
+        )
+        self.store.claim_next_run(
+            worker_id="worker-one", concurrency=1, lease_seconds=60
+        )
+        blocker = sqlite3.connect(self.path)
+        blocker.execute("BEGIN IMMEDIATE")
+        result: list[bool] = []
+        started = threading.Event()
+
+        def renew() -> None:
+            started.set()
+            result.append(
+                self.store.renew_model_slot(
+                    run_id=run["run_id"],
+                    slot_id=1,
+                    worker_id="worker-one",
+                    lease_seconds=0.1,
+                )
+            )
+
+        thread = threading.Thread(target=renew)
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        time.sleep(0.2)
+        lock_released_at = datetime.now(timezone.utc)
+        blocker.commit()
+        blocker.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [True])
+        with sqlite3.connect(self.path) as connection:
+            lease_until = connection.execute(
+                "SELECT lease_until FROM model_slots WHERE slot_id = 1"
+            ).fetchone()[0]
+        deadline = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+        self.assertGreater(deadline, lock_released_at)
+
     def test_admission_constraints_are_independent(self):
         first, _ = self.store.create_run(
             RunRequest("primera"), user_id="one", provenance=PROVENANCE
@@ -931,6 +1054,32 @@ class ServiceTests(unittest.TestCase):
                     user_id="evaluator",
                     admin=True,
                 )
+        finally:
+            service.close()
+
+    def test_submit_maps_transactional_idempotency_payload_conflict(self):
+        self.store.initialize()
+        existing, _ = self.store.create_run(
+            RunRequest("pregunta original", client_request_id="request-race"),
+            user_id="evaluator",
+            provenance=PROVENANCE,
+        )
+        self.store.append_event(existing["run_id"], "failed", {"code": "test"})
+        executor = FakeExecutor()
+        service = EvaluationService(self.store, executor, executor.provenance)
+        service.start()
+        try:
+            # Simulate two processes both missing their preliminary read. The
+            # create transaction must still reject the loser's changed body.
+            with mock.patch.object(service, "idempotent_run", return_value=None):
+                with self.assertRaises(IdempotencyConflictError):
+                    service.submit(
+                        RunRequest(
+                            "pregunta diferente", client_request_id="request-race"
+                        ),
+                        user_id="evaluator",
+                        admin=True,
+                    )
         finally:
             service.close()
 
@@ -1103,7 +1252,6 @@ class ServiceTests(unittest.TestCase):
             lease_seconds=1,
         )
         first_service.start()
-        second_service.start()
         try:
             first = first_service.submit(
                 RunRequest("primera", client_request_id="shared-1"),
@@ -1111,6 +1259,9 @@ class ServiceTests(unittest.TestCase):
                 admin=True,
             )
             self.assertTrue(first_executor.started.wait(timeout=1))
+            # Start the competing process only after the first process owns
+            # the slot; either service is otherwise allowed to claim first.
+            second_service.start()
             second = second_service.submit(
                 RunRequest("segunda", client_request_id="shared-2"),
                 user_id="shared-u2",
@@ -1258,6 +1409,49 @@ class ServiceTests(unittest.TestCase):
         service.worker.join(timeout=1)
         self.assertTrue(executor.closed)
 
+    def test_last_of_multiple_workers_closes_executor_after_timed_out_shutdown(self):
+        class ClosingConcurrentExecutor(ConcurrentBlockingExecutor):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        executor = ClosingConcurrentExecutor()
+        service = EvaluationService(
+            self.store,
+            executor,
+            executor.provenance,
+            model_concurrency=2,
+            scheduler_workers=2,
+            shutdown_timeout=0.01,
+        )
+        service.start()
+        service.submit(RunRequest("primera"), user_id="one", admin=True)
+        service.submit(RunRequest("segunda"), user_id="two", admin=True)
+        self.assertTrue(executor.started.wait(timeout=1))
+        service.close()
+        self.assertFalse(executor.closed)
+        executor.release.set()
+        for worker in service.workers:
+            worker.join(timeout=1)
+        self.assertTrue(executor.closed)
+
+    def test_heartbeat_interval_remains_shorter_than_tiny_lease(self):
+        service = EvaluationService(
+            self.store,
+            FakeExecutor(),
+            lambda: dict(PROVENANCE),
+            lease_seconds=0.03,
+        )
+        stop = mock.Mock()
+        stop.wait.return_value = True
+        service._lease_heartbeat(stop, "run-id", 1)
+        interval = stop.wait.call_args.args[0]
+        self.assertAlmostEqual(interval, 0.01)
+        self.assertLess(interval, service.lease_seconds)
+
     def test_close_never_blocks_on_full_queue_or_writes_late_results(self):
         executor = BlockingExecutor()
         service = EvaluationService(
@@ -1344,6 +1538,7 @@ class ServiceTests(unittest.TestCase):
             recovered = service.public_run(run["run_id"], admin=True)
             self.assertEqual(recovered["status"], "failed")
             self.assertEqual(recovered["error"]["code"], "service_restarted")
+            self.assertEqual(self.store.progress_for_run(run["run_id"]), [])
             self.assertTrue(service.worker.is_alive())
             follow_up = service.submit(RunRequest("segunda"), user_id="one", admin=True)
             self.assertEqual(
