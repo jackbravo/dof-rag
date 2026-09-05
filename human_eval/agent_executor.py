@@ -418,6 +418,8 @@ def _public_result(run: dict[str, Any]) -> dict[str, Any]:
         warnings.append("coverage_incomplete")
     if run["answer"].get("invalid_citations"):
         warnings.append("invalid_citations_removed")
+    if run.get("verification", {}).get("premise_status_review_required"):
+        warnings.append("premise_status_review_required")
     if run["stop_reason"] != "completed":
         warnings.append(run["stop_reason"])
     return {

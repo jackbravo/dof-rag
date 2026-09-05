@@ -222,6 +222,35 @@ def _has_affirmative_premise_correction(answer: str) -> bool:
     return False
 
 
+def _has_explicit_premise_correction(answer: str) -> bool:
+    """Flag an explicit negation-plus-correction structure for review.
+
+    Stricter than ``_has_affirmative_premise_correction``: that helper treats
+    any clause with a verb like ``vigente`` or ``establece`` as a correction,
+    which is safe only as validation after the model already chose ``false``.
+    This signal never changes an ``unclear`` status; it only requests review
+    when the answer appears to negate the premise (``no ...`` or a ``sino``
+    contrast) and then state affirmatively what holds instead.
+    """
+    clauses = [
+        clause
+        for clause in re.split(r"[.;]\s*", _fold_for_coverage(answer))
+        if clause
+    ]
+    premise_denied = False
+    for clause in clauses:
+        if " sino " in f" {clause} " and CORRECTION_ASSERTION_RE.search(clause):
+            return True
+        if SEARCH_FAILURE_RE.search(clause):
+            continue
+        if clause.startswith("no "):
+            premise_denied = True
+            continue
+        if premise_denied and CORRECTION_ASSERTION_RE.search(clause):
+            return True
+    return False
+
+
 FINAL_ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -321,6 +350,8 @@ class ToolTrace:
     arguments: dict[str, Any] | None
     output: dict[str, Any]
     elapsed_ms: float
+    full_output_bytes: int = 0
+    model_output_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -399,12 +430,15 @@ def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
 def _normalize_nullable_literals(
     schema: dict[str, Any], arguments: dict[str, Any]
 ) -> dict[str, Any]:
-    """Tolerate local models that serialize JSON null as the string ``null``."""
+    """Tolerate local models that serialize null as ``null`` or ``None``."""
     normalized = dict(arguments)
     properties = schema.get("properties", {})
     for name, value in arguments.items():
         expected = properties.get(name, {}).get("type")
-        if value == "null" and isinstance(expected, list) and "null" in expected:
+        is_string_null = (
+            isinstance(value, str) and value.strip().lower() in {"null", "none"}
+        )
+        if is_string_null and isinstance(expected, list) and "null" in expected:
             normalized[name] = None
     return normalized
 
@@ -1125,7 +1159,8 @@ def _parse_final_answer(
         raise CitationCoverageError(
             f"final answer requires citations from {required_hops} distinct documents"
         )
-    if data["premise_status"] == "false" and not _has_affirmative_premise_correction(
+    premise_status = data["premise_status"]
+    if premise_status == "false" and not _has_affirmative_premise_correction(
         data["answer"]
     ):
         raise PremiseCorrectionRequiredError(
@@ -1137,7 +1172,7 @@ def _parse_final_answer(
         invalid_citations=[
             citation for citation in proposed if citation not in allowed
         ],
-        premise_status=data["premise_status"],
+        premise_status=premise_status,
     )
 
 
@@ -1170,6 +1205,10 @@ def _verification(
         ),
         "correction_supported_by_citations": (
             "human_review_required" if false_premise else "not_applicable"
+        ),
+        "premise_status_review_required": (
+            answer.premise_status == "unclear"
+            and _has_explicit_premise_correction(answer.answer)
         ),
     }
 
@@ -1357,6 +1396,18 @@ class AgentRunner:
                         tool_started = perf_counter()
                         output = self.toolbox.call(call.name, call.arguments)
                         elapsed_ms = (perf_counter() - tool_started) * 1000.0
+                    model_output = _model_tool_output(call.name, output)
+                    model_output_text = json.dumps(
+                        model_output,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if call.name in available_names and len(traces) < self.max_tool_calls:
+                        full_output_bytes = len(
+                            json.dumps(
+                                output, ensure_ascii=False, separators=(",", ":")
+                            ).encode("utf-8")
+                        )
                         traces.append(
                             ToolTrace(
                                 sequence=len(traces) + 1,
@@ -1366,6 +1417,8 @@ class AgentRunner:
                                 arguments=call.arguments,
                                 output=output,
                                 elapsed_ms=elapsed_ms,
+                                full_output_bytes=full_output_bytes,
+                                model_output_bytes=len(model_output_text.encode("utf-8")),
                             )
                         )
                     _emit_progress(
@@ -1383,7 +1436,7 @@ class AgentRunner:
                         {
                             "type": "function_call_output",
                             "call_id": call.call_id,
-                            "output": json.dumps(output, ensure_ascii=False),
+                            "output": model_output_text,
                         }
                     )
                 continue
@@ -1640,6 +1693,121 @@ def _tool_reason(name: str) -> str:
         "get_document_outline": "La estructura ayuda a ubicar las secciones que conviene leer.",
         "read_chunks": "Sólo los chunks leídos pueden convertirse en evidencia y citas de la respuesta.",
     }.get(name, "Esta consulta aporta evidencia observable para el siguiente paso.")
+
+
+MODEL_EVIDENCE_SNIPPET_CHARS = 360
+
+
+def _present_fields(item: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        name: item[name]
+        for name in names
+        if name in item and item[name] not in (None, [], "")
+    }
+
+
+def _model_tool_output(name: str, output: dict[str, Any]) -> dict[str, Any]:
+    """Return the smallest tool result the model needs for its next decision."""
+    if not output.get("ok"):
+        error = output.get("error", {})
+        return {
+            "ok": False,
+            "error": {
+                "type": error.get("type", "tool_error"),
+                "message": error.get("message", "La consulta falló."),
+            },
+        }
+
+    data = output.get("data", {})
+    compact: dict[str, Any] = {"ok": True}
+    if name in {"list_publications", "search_documents"}:
+        source_key = "publications" if name == "list_publications" else "documents"
+        items = data.get(source_key, [])
+        compact[source_key] = [
+            _present_fields(
+                item,
+                (
+                    "document_id",
+                    "publication_date",
+                    "section",
+                    "title",
+                    "institution",
+                    "rank",
+                ),
+            )
+            for item in items
+        ]
+        return compact
+
+    if name == "search_evidence":
+        query = str(data.get("query") or "")
+        evidence = []
+        for item in data.get("evidence", []):
+            snippet, narrowed = _query_snippet(
+                str(item.get("snippet") or ""),
+                query,
+                MODEL_EVIDENCE_SNIPPET_CHARS,
+            )
+            candidate = _present_fields(
+                item,
+                (
+                    "chunk_id",
+                    "document_id",
+                    "heading_path",
+                    "rank",
+                ),
+            )
+            candidate["snippet"] = snippet
+            if item.get("snippet_truncated") or narrowed:
+                candidate["snippet_truncated"] = True
+            evidence.append(candidate)
+        compact["evidence"] = evidence
+        return compact
+
+    if name == "get_document_outline":
+        compact.update(
+            _present_fields(
+                data,
+                (
+                    "document_id",
+                    "publication_date",
+                    "section",
+                    "title",
+                    "institution",
+                    "outline_truncated",
+                ),
+            )
+        )
+        compact["chunks"] = [
+            _present_fields(
+                item,
+                ("chunk_id", "chunk_index", "heading_path", "token_count"),
+            )
+            for item in data.get("chunks", [])
+        ]
+        return compact
+
+    if name == "read_chunks":
+        compact["chunks"] = [
+            _present_fields(
+                item,
+                (
+                    "chunk_id",
+                    "document_id",
+                    "publication_date",
+                    "section",
+                    "heading_path",
+                    "title",
+                    "text",
+                ),
+            )
+            for item in data.get("chunks", [])
+        ]
+        if "coverage" in data:
+            compact["coverage"] = data["coverage"]
+        return compact
+
+    return output
 
 
 def _public_tool_progress(

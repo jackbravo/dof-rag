@@ -1718,11 +1718,15 @@ def main() -> int:
             )
         # The factory is required for Uvicorn to create the application inside
         # each worker process. SQLite-backed claims keep their queues shared.
-        os.environ["DOF_APP_REPO_ROOT"] = str(args.repo_root.resolve())
+        repo_root = args.repo_root.resolve()
+        settings = WebSettings.from_env(repo_root)
+        os.environ["DOF_APP_REPO_ROOT"] = str(repo_root)
         uvicorn.run(
             "human_eval.app:create_uvicorn_app",
             factory=True,
             workers=args.workers,
+            host=settings.host,
+            port=settings.port,
             access_log=False,
         )
         return 0

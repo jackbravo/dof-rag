@@ -40,6 +40,10 @@ class DailyQuotaConflict(RuntimeError):
     """The user has reached the configured rolling question limit."""
 
 
+class InvalidRunTransition(ValueError):
+    """A run event lost a race with an already-written terminal event."""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
@@ -318,6 +322,10 @@ class EvaluationStore:
         lease_until = self._lease_until(lease_seconds)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # A replacement worker often starts before the dead worker's lease
+            # expires. Reap on every claim attempt as well as at startup so the
+            # slot becomes available once its deadline actually passes.
+            self._recover_expired_model_slots_in_connection(connection, now)
             slot = connection.execute(
                 "SELECT slot_id FROM model_slots "
                 "WHERE slot_id <= ? AND run_id IS NULL ORDER BY slot_id LIMIT 1",
@@ -391,45 +399,54 @@ class EvaluationStore:
             )
         return cursor.rowcount
 
-    def recover_expired_model_slots(self) -> int:
-        """Fail runs whose scheduler lease expired without a heartbeat."""
-        now = utc_now()
+    @staticmethod
+    def _recover_expired_model_slots_in_connection(
+        connection: sqlite3.Connection, now: str
+    ) -> int:
         recovered = 0
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            slots = connection.execute(
-                "SELECT slot_id, run_id FROM model_slots WHERE run_id IS NOT NULL "
-                "AND lease_until IS NOT NULL AND lease_until <= ?",
-                (now,),
-            ).fetchall()
-            for slot in slots:
-                run_id = str(slot[1])
-                current = connection.execute(
-                    "SELECT event_type, sequence FROM run_events WHERE run_id = ? "
-                    "ORDER BY sequence DESC LIMIT 1",
-                    (run_id,),
-                ).fetchone()
-                if current is not None and current[0] == "started":
-                    connection.execute(
-                        "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
-                        "VALUES (?, ?, 'failed', ?, ?)",
-                        (
-                            run_id,
-                            int(current[1]) + 1,
-                            now,
-                            _json({
+        slots = connection.execute(
+            "SELECT slot_id, run_id FROM model_slots WHERE run_id IS NOT NULL "
+            "AND lease_until IS NOT NULL AND lease_until <= ?",
+            (now,),
+        ).fetchall()
+        for slot in slots:
+            run_id = str(slot[1])
+            current = connection.execute(
+                "SELECT event_type, sequence FROM run_events WHERE run_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if current is not None and current[0] == "started":
+                connection.execute(
+                    "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                    "VALUES (?, ?, 'failed', ?, ?)",
+                    (
+                        run_id,
+                        int(current[1]) + 1,
+                        now,
+                        _json(
+                            {
                                 "code": "service_restarted",
                                 "message": "La ejecución se interrumpió antes de terminar.",
-                            }),
+                            }
                         ),
-                    )
-                    recovered += 1
-                connection.execute(
-                    "UPDATE model_slots SET run_id = NULL, worker_id = NULL, lease_until = NULL "
-                    "WHERE slot_id = ?",
-                    (int(slot[0]),),
+                    ),
                 )
+                recovered += 1
+            connection.execute(
+                "UPDATE model_slots SET run_id = NULL, worker_id = NULL, lease_until = NULL "
+                "WHERE slot_id = ?",
+                (int(slot[0]),),
+            )
         return recovered
+
+    def recover_expired_model_slots(self) -> int:
+        """Fail runs whose scheduler lease expired without a heartbeat."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._recover_expired_model_slots_in_connection(
+                connection, utc_now()
+            )
 
     def recover_unclaimed_started_runs(self) -> int:
         """Recover pre-v4 started runs that have no scheduler lease."""
@@ -770,7 +787,7 @@ class EvaluationStore:
                 "failed": set(),
             }
             if event_type not in allowed[current["event_type"]]:
-                raise ValueError(
+                raise InvalidRunTransition(
                     f"invalid run transition {current['event_type']} -> {event_type}"
                 )
             connection.execute(

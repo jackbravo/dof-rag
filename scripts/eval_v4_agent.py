@@ -80,6 +80,7 @@ def calculate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     precisions: list[float] = []
     recalls: list[float] = []
     false_premise: list[bool] = []
+    false_premise_labeled: list[bool] = []
     tool_errors = 0
     totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     for item in completed:
@@ -97,7 +98,15 @@ def calculate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         for key in totals:
             totals[key] += item["run"]["usage"].get(key, 0)
         if item["category"] == "negative_false_premise":
-            false_premise.append(item["run"]["answer"]["premise_status"] == "false")
+            # A run corrects the false premise when the model labels it false
+            # or when verification flags an explicit correction left as
+            # ``unclear``; the label-only rate measures self-labeling.
+            labeled_false = item["run"]["answer"]["premise_status"] == "false"
+            review_flagged = item["run"].get("verification", {}).get(
+                "premise_status_review_required", False
+            )
+            false_premise.append(labeled_false or review_flagged)
+            false_premise_labeled.append(labeled_false)
     n = len(completed)
     return {
         "n": len(results),
@@ -108,6 +117,11 @@ def calculate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "citation_recall": sum(recalls) / n,
         "false_premise_correction_accuracy": (
             sum(false_premise) / len(false_premise) if false_premise else None
+        ),
+        "false_premise_label_accuracy": (
+            sum(false_premise_labeled) / len(false_premise_labeled)
+            if false_premise_labeled
+            else None
         ),
         "coverage_completion_rate": coverage_completion_rate,
         "tool_error_count": tool_errors,

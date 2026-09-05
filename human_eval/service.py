@@ -17,6 +17,7 @@ from .store import (
     ActiveRunConflict,
     DailyQuotaConflict,
     EvaluationStore,
+    InvalidRunTransition,
     QueueCapacityConflict,
 )
 
@@ -157,11 +158,9 @@ class EvaluationService:
         for worker in self.workers:
             worker.join(timeout=self.shutdown_timeout)
         if any(worker.is_alive() for worker in self.workers):
-            expired = self.store.expire_model_leases(self.worker_id)
-            if expired:
-                LOGGER.warning("expired %s model leases during shutdown", expired)
             LOGGER.warning(
-                "human-evaluation worker is still waiting for an in-flight call"
+                "human-evaluation worker is still waiting for an in-flight call; "
+                "its model lease will expire naturally"
             )
         else:
             self._close_executor()
@@ -186,6 +185,12 @@ class EvaluationService:
             # obviously rejected request. The transactional checks inside
             # create_run remain authoritative across web processes.
             if self.store.has_active_run(user_id):
+                LOGGER.warning(
+                    "admission rejected: active run exists "
+                    "(depth=%s, capacity=%s)",
+                    self.store.queue_depth(),
+                    self.queue.maxsize,
+                )
                 raise ActiveRunError("user already has an active run")
             daily_since: str | None = None
             if not admin:
@@ -204,7 +209,13 @@ class EvaluationService:
                         >= daily_question_limit
                     ):
                         raise QuotaExceededError("daily question limit reached")
-            if self.store.queue_depth() >= self.queue.maxsize:
+            queue_depth = self.store.queue_depth()
+            if queue_depth >= self.queue.maxsize:
+                LOGGER.warning(
+                    "admission rejected: queue full (depth=%s, capacity=%s)",
+                    queue_depth,
+                    self.queue.maxsize,
+                )
                 raise QueueFullError("execution queue is full")
             prepare_executor = getattr(self.executor, "prepare", None)
             if callable(prepare_executor):
@@ -224,8 +235,19 @@ class EvaluationService:
                     daily_since=daily_since,
                 )
             except ActiveRunConflict as exc:
+                LOGGER.warning(
+                    "admission rejected: active run exists "
+                    "(depth=%s, capacity=%s)",
+                    self.store.queue_depth(),
+                    self.queue.maxsize,
+                )
                 raise ActiveRunError("user already has an active run") from exc
             except QueueCapacityConflict as exc:
+                LOGGER.warning(
+                    "admission rejected: queue full (depth=%s, capacity=%s)",
+                    self.store.queue_depth(),
+                    self.queue.maxsize,
+                )
                 raise QueueFullError("execution queue is full") from exc
             except DailyQuotaConflict as exc:
                 raise QuotaExceededError("daily question limit reached") from exc
@@ -235,7 +257,11 @@ class EvaluationService:
                 except queue.Full:
                     # Notification loss is harmless: every worker polls the
                     # persistent queue as a fallback.
-                    pass
+                    LOGGER.debug(
+                        "local wake-up queue full after persisting run %s; "
+                        "SQLite polling will claim it",
+                        run["run_id"],
+                    )
             return self.public_run(run["run_id"], user_id=user_id, admin=True)
 
     def idempotent_run(
@@ -459,7 +485,7 @@ class EvaluationService:
                 return False
             try:
                 self.store.append_event(run_id, event_type, payload)
-            except ValueError:
+            except InvalidRunTransition:
                 # Another process may have recovered this run after our lease
                 # lapsed (restart, stalled heartbeat) and written a terminal
                 # event. That terminal event wins: drop our late result and

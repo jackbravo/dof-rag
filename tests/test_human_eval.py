@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +26,9 @@ from human_eval.app import (
     _sanitize_login_next,
     create_app,
 )
+from human_eval.app import (
+    main as app_main,
+)
 from human_eval.auth import FakeAuthBackend, User
 from human_eval.contracts import ContractError, FeedbackRequest, RunRequest
 from human_eval.markdown_render import render_markdown_html
@@ -33,6 +37,7 @@ from human_eval.service import (
     EvaluationService,
     IdempotencyConflictError,
     PublicExecutionError,
+    QueueFullError,
 )
 from human_eval.store import (
     SCHEMA_VERSION,
@@ -255,6 +260,46 @@ class AgentResultTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["missing"], ["año 2025"])
         self.assertFalse(result["coverage"]["complete"])
         self.assertIn("invalid_citations_removed", result["warnings"])
+        self.assertNotIn("premise_status_review_required", result["warnings"])
+
+    def test_public_result_flags_a_premise_status_needing_review(self):
+        result = _public_result(
+            {
+                "answer": {
+                    "answer": "No reformó el artículo 123; reformó el 76.",
+                    "citations": [123],
+                    "invalid_citations": [],
+                    "premise_status": "unclear",
+                },
+                "traces": [
+                    {
+                        "name": "read_chunks",
+                        "output": {
+                            "ok": True,
+                            "data": {
+                                "chunks": [
+                                    {
+                                        "chunk_id": 123,
+                                        "document_id": 45,
+                                        "path": "2026/documento.md",
+                                        "text": "Pasaje verificable.",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                ],
+                "coverage": {},
+                "verification": {"premise_status_review_required": True},
+                "stop_reason": "completed",
+                "model_turns": 3,
+                "tool_calls": 1,
+                "usage": {"total_tokens": 100},
+                "elapsed_ms": 12.5,
+            }
+        )
+        self.assertEqual(result["answer"]["premise_status"], "unclear")
+        self.assertIn("premise_status_review_required", result["warnings"])
 
     def test_provenance_distinguishes_available_from_used_vector_index(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1009,6 +1054,37 @@ class ServiceTests(unittest.TestCase):
             executor.release.set()
             service.close()
 
+    def test_queue_full_rejection_is_logged(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store, executor, executor.provenance, queue_capacity=1
+        )
+        service.start()
+        try:
+            service.submit(
+                RunRequest("primera", client_request_id="q1"),
+                user_id="u1",
+                admin=True,
+            )
+            self.assertTrue(executor.started.wait(timeout=3))
+            service.submit(
+                RunRequest("segunda", client_request_id="q2"),
+                user_id="u2",
+                admin=True,
+            )
+            with self.assertLogs("human_eval.service", level="WARNING") as captured:
+                with self.assertRaises(QueueFullError):
+                    service.submit(
+                        RunRequest("tercera", client_request_id="q3"),
+                        user_id="u3",
+                        admin=True,
+                    )
+            self.assertIn("queue full", captured.output[0])
+            self.assertIn("capacity=1", captured.output[0])
+        finally:
+            executor.release.set()
+            service.close()
+
     def test_two_services_share_one_sqlite_model_slot(self):
         first_executor = BlockingExecutor()
         second_executor = BlockingExecutor()
@@ -1053,6 +1129,40 @@ class ServiceTests(unittest.TestCase):
             first_service.close()
             second_service.close()
 
+    def test_running_worker_reaps_a_lease_that_expires_after_startup(self):
+        self.store.initialize()
+        self.store.initialize_model_slots(1)
+        interrupted, _ = self.store.create_run(
+            RunRequest("interrumpida"), user_id="dead-worker", provenance=PROVENANCE
+        )
+        self.assertIsNotNone(
+            self.store.claim_next_run(
+                worker_id="dead-worker",
+                concurrency=1,
+                lease_seconds=60,
+            )
+        )
+        queued, _ = self.store.create_run(
+            RunRequest("siguiente"), user_id="waiting", provenance=PROVENANCE
+        )
+
+        service = EvaluationService(
+            self.store, FakeExecutor(), lambda: dict(PROVENANCE)
+        )
+        service.start()
+        try:
+            # The replacement was already running while the old lease was
+            # valid. Expiring it later must still unblock the persistent queue.
+            self.assertEqual(self.store.expire_model_leases("dead-worker"), 1)
+            self.assertEqual(
+                wait_for_terminal(service, queued["run_id"])["status"], "succeeded"
+            )
+            recovered = service.public_run(interrupted["run_id"], admin=True)
+            self.assertEqual(recovered["status"], "failed")
+            self.assertEqual(recovered["error"]["code"], "service_restarted")
+        finally:
+            service.close()
+
     def test_one_service_runs_configured_parallel_workers(self):
         executor = ConcurrentBlockingExecutor()
         service = EvaluationService(
@@ -1076,6 +1186,35 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(
                 wait_for_terminal(service, second["run_id"])["status"], "succeeded"
             )
+        finally:
+            executor.release.set()
+            service.close()
+
+    def test_active_run_rejection_is_logged_without_user_id(self):
+        executor = BlockingExecutor()
+        service = EvaluationService(
+            self.store, executor, executor.provenance, queue_capacity=2
+        )
+        service.start()
+        try:
+            service.submit(
+                RunRequest("primera", client_request_id="active-1"),
+                user_id="sensitive-user-id",
+                admin=True,
+            )
+            self.assertTrue(executor.started.wait(timeout=3))
+            with self.assertLogs("human_eval.service", level="WARNING") as captured:
+                with self.assertRaises(ActiveRunError):
+                    service.submit(
+                        RunRequest("segunda", client_request_id="active-2"),
+                        user_id="sensitive-user-id",
+                        admin=True,
+                    )
+            message = captured.output[0]
+            self.assertIn("active run exists", message)
+            self.assertIn("depth=0", message)
+            self.assertIn("capacity=2", message)
+            self.assertNotIn("sensitive-user-id", message)
         finally:
             executor.release.set()
             service.close()
@@ -1126,6 +1265,7 @@ class ServiceTests(unittest.TestCase):
             executor,
             executor.provenance,
             queue_capacity=1,
+            lease_seconds=0.2,
             shutdown_timeout=0.01,
         )
         service.start()
@@ -1152,13 +1292,28 @@ class ServiceTests(unittest.TestCase):
         )
         replacement.start()
         try:
-            recovered_first = service.public_run(first["run_id"], admin=True)
             recovered_second = wait_for_terminal(replacement, second["run_id"])
+            recovered_first = service.public_run(first["run_id"], admin=True)
             self.assertEqual(recovered_first["status"], "failed")
             self.assertEqual(recovered_first["error"]["code"], "service_restarted")
             self.assertEqual(recovered_second["status"], "succeeded")
         finally:
             replacement.close()
+
+    def test_non_transition_value_error_is_not_hidden(self):
+        executor = FakeExecutor()
+        service = EvaluationService(self.store, executor, executor.provenance)
+        service.start()
+        try:
+            with mock.patch.object(
+                self.store,
+                "append_event",
+                side_effect=ValueError("serialization failed"),
+            ):
+                with self.assertRaisesRegex(ValueError, "serialization failed"):
+                    service._append_event_if_open("run-id", "succeeded", {})
+        finally:
+            service.close()
 
     def test_worker_survives_when_recovery_wins_the_lease_race(self):
         executor = BlockingExecutor()
@@ -1197,6 +1352,31 @@ class ServiceTests(unittest.TestCase):
             )
         finally:
             service.close()
+
+
+class AppMainTests(unittest.TestCase):
+    def test_multi_worker_server_honors_configured_host_and_port(self):
+        env = {
+            "DOF_SESSION_SECRET": "test-session-secret-that-is-at-least-32-bytes",
+            "DOF_WEB_HOST": "0.0.0.0",
+            "DOF_WEB_PORT": "9876",
+            "DOF_RETRIEVAL_MODE": "lexical",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(sys, "argv", ["human_eval.app", "--workers", "3"]),
+            mock.patch("human_eval.app.uvicorn.run") as run,
+        ):
+            self.assertEqual(app_main(), 0)
+
+        run.assert_called_once_with(
+            "human_eval.app:create_uvicorn_app",
+            factory=True,
+            workers=3,
+            host="0.0.0.0",
+            port=9876,
+            access_log=False,
+        )
 
 
 class AirAppTestCase(unittest.TestCase):
