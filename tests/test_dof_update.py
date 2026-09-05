@@ -344,5 +344,72 @@ class DailyUpdateTests(unittest.TestCase):
             )
 
 
+class PermanentlyMissingDownloadTest(unittest.TestCase):
+    def _missing_response(self) -> mock.Mock:
+        response = mock.Mock()
+        response.content = (
+            b"<!DOCTYPE html><html><title>El archivo no existe</title>"
+            + b"x" * 1024
+        )
+        response.url = (
+            "https://sidof.segob.gob.mx/notificacion/page/204/"
+            "El%20archivo%20no%20existe"
+        )
+        response.headers = {"Content-Type": "text/html; charset=UTF-8"}
+        response.text = "<html><body>El archivo no existe</body></html>"
+        response.raise_for_status = lambda: None
+        return response
+
+    def test_permanent_missing_creates_tombstone_without_error(self):
+        session = mock.Mock()
+        session.get.return_value = self._missing_response()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "001_AVISO_20260825_MAT_5789248.doc"
+            old_errors = get_word_dof.ERROR_COUNT
+            try:
+                get_word_dof.ERROR_COUNT = 0
+                ok = get_word_dof._download_file(
+                    session,
+                    "https://sidof.segob.gob.mx/notas/getDoc/5789248",
+                    target,
+                )
+                self.assertFalse(ok)
+                self.assertEqual(get_word_dof.ERROR_COUNT, 0)
+            finally:
+                get_word_dof.ERROR_COUNT = old_errors
+            self.assertFalse(target.exists())
+            marker = root / "001_AVISO_20260825_MAT_5789248.doc.missing"
+            self.assertTrue(marker.exists())
+            self.assertTrue(get_word_dof.has_missing_marker(root, "5789248"))
+            self.assertFalse(get_word_dof.has_missing_marker(root, "99999"))
+
+    def test_invalid_payload_without_missing_page_still_errors(self):
+        session = mock.Mock()
+        response = mock.Mock()
+        response.content = b"<html><title>500</title></html>" + b"x" * 1024
+        response.url = "https://sidof.segob.gob.mx/notas/getDoc/5789248"
+        response.headers = {"Content-Type": "text/html"}
+        response.text = "<html><title>500</title></html>"
+        response.raise_for_status = lambda: None
+        session.get.return_value = response
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "001_AVISO_20260825_MAT_5789248.doc"
+            old_errors = get_word_dof.ERROR_COUNT
+            try:
+                get_word_dof.ERROR_COUNT = 0
+                ok = get_word_dof._download_file(
+                    session,
+                    "https://sidof.segob.gob.mx/notas/getDoc/5789248",
+                    target,
+                )
+                self.assertFalse(ok)
+                self.assertEqual(get_word_dof.ERROR_COUNT, 1)
+            finally:
+                get_word_dof.ERROR_COUNT = old_errors
+            self.assertFalse(get_word_dof.has_missing_marker(root, "5789248"))
+
+
 if __name__ == "__main__":
     unittest.main()

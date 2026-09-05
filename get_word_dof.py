@@ -21,8 +21,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import requests
 import typer
@@ -72,7 +71,7 @@ def setup_session() -> requests.Session:
     return session
 
 
-def extract_word_links(html_content: str, base_url: str = 'https://www.dof.gob.mx') -> List[tuple[str, str]]:
+def extract_word_links(html_content: str, base_url: str = 'https://www.dof.gob.mx') -> list[tuple[str, str]]:
     """
     Extracts WORD file links from HTML content
     
@@ -100,7 +99,7 @@ def extract_word_links(html_content: str, base_url: str = 'https://www.dof.gob.m
     return word_links
 
 
-def extract_notice_links(html_content: str) -> List[tuple[str, str]]:
+def extract_notice_links(html_content: str) -> list[tuple[str, str]]:
     """
     Extracts notice links from SIDOF HTML content for all AVISOS subsections
     Detects edition (MAT/VES) based on tab-pane container
@@ -211,6 +210,18 @@ def _download_file(session: requests.Session, url: str, output_path: Path, file_
         response.raise_for_status()
         
         if not is_valid_word_payload(response.content):
+            if _is_permanent_missing(response):
+                # The source states the file does not exist; retrying on
+                # every daily run would fail forever. Record a tombstone
+                # next to the target and skip it from now on (delete the
+                # marker to force a retry). Not counted as an error.
+                marker = output_path.with_suffix(output_path.suffix + ".missing")
+                marker.write_text(response.url + "\n", encoding="utf-8")
+                logging.warning(
+                    f"Source reports the file does not exist; "
+                    f"marking permanently missing: {url}"
+                )
+                return False
             logging.error(f"Invalid WORD payload returned by {url}")
             if output_path.exists() and not is_valid_word_file(output_path):
                 output_path.unlink()
@@ -259,6 +270,24 @@ def download_notice_file(session: requests.Session, note_id: str, output_path: P
 def has_valid_download(date_dir: Path, note_id: str) -> bool:
     """Return whether this note exists under any page-order sequence number."""
     return any(is_valid_word_file(path) for path in date_dir.glob(f"*_{note_id}.doc"))
+
+
+def _is_permanent_missing(response: requests.Response) -> bool:
+    """Whether the source server states that the file does not exist.
+
+    SIDOF redirects such notes to an "El archivo no existe" HTML page; that
+    is a permanent source-side absence, not a transient download failure.
+    """
+    if "archivo no existe" in unquote(response.url).lower():
+        return True
+    if "html" not in response.headers.get("Content-Type", "").lower():
+        return False
+    return "el archivo no existe" in response.text.lower()
+
+
+def has_missing_marker(date_dir: Path, note_id: str) -> bool:
+    """Whether a previous run recorded this note as permanently unavailable."""
+    return any(date_dir.glob(f"*_{note_id}.doc.missing"))
 
 
 def _create_edition_dir(output_dir: Path, day: str, month: str, year: str, edition: str) -> Path:
@@ -324,6 +353,10 @@ def process_sidof_notices(session: requests.Session, day: str, month: str, year:
             
             if has_valid_download(date_dir, note_id):
                 logging.info(f"Notice already downloaded: {note_id}")
+                continue
+            
+            if has_missing_marker(date_dir, note_id):
+                logging.info(f"Notice permanently missing, skipping: {note_id}")
                 continue
             
             if download_notice_file(session, note_id, output_path):
@@ -393,6 +426,10 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
                     logging.info(f"WORD note already downloaded: {codnota}")
                     continue
 
+                if has_missing_marker(date_dir, codnota):
+                    logging.info(f"WORD note permanently missing, skipping: {codnota}")
+                    continue
+
                 if download_word_file(session, word_url, output_path):
                     downloaded_count += 1
 
@@ -412,7 +449,7 @@ def process_dof_page(session: requests.Session, date_str: str, edition: str, out
 
 def main(
     date: str = typer.Argument(..., help="Fecha (DD/MM/YYYY) o fecha de inicio para rango"),
-    end_date: Optional[str] = typer.Argument(None, help="Fecha de fin (DD/MM/YYYY) - opcional para rango de fechas"),
+    end_date: str | None = typer.Argument(None, help="Fecha de fin (DD/MM/YYYY) - opcional para rango de fechas"),
     output_dir: str = typer.Option("./dof_word", help="Directorio de salida"),
     editions: str = typer.Option("both", help="Ediciones a descargar: 'mat', 'ves', o 'both'"),
     log_level: str = typer.Option("INFO", help="Nivel de logging: DEBUG, INFO, WARNING, ERROR"),

@@ -186,13 +186,17 @@ def _split_h2_compound(text: str, doc_id: str, pattern: DocPattern) -> list[Chun
         if not content.strip():
             continue
         content = BOILERPLATE_H.sub("", content)
-        chunk_text = f"## {heading}\n\n{content}"
+        # heading is "" for the preamble (content before the first H2);
+        # emit it without inventing a heading prefix.
+        prefix = f"## {heading}\n\n" if heading else ""
+        base_path = [heading] if heading else _extract_h1(content)
+        chunk_text = prefix + content
         token_count = _count_tokens(chunk_text)
         if token_count <= H2_MAX_TOKENS:
             chunks.append(
                 Chunk(
                     text=chunk_text,
-                    heading_path=[heading],
+                    heading_path=base_path,
                     chunk_index=len(chunks),
                     pattern=pattern,
                     has_image=bool(IMAGE_RE.search(content)),
@@ -205,7 +209,6 @@ def _split_h2_compound(text: str, doc_id: str, pattern: DocPattern) -> list[Chun
             if len(sub_sections) == 1 and sub_sections[0][0] == "":
                 sub_content = BOILERPLATE_H.sub("", sub_sections[0][1])
                 if sub_content.strip():
-                    prefix = f"## {heading}\n\n"
                     prefix_tokens = _count_tokens(prefix)
                     budget = max(1, MAX_TOKENS - prefix_tokens)
                     overlap = min(OVERLAP_TOKENS, budget - 1)
@@ -214,7 +217,7 @@ def _split_h2_compound(text: str, doc_id: str, pattern: DocPattern) -> list[Chun
                         chunks.append(
                             Chunk(
                                 text=prefix + part,
-                                heading_path=[heading],
+                                heading_path=base_path,
                                 chunk_index=len(chunks),
                                 pattern=pattern,
                                 has_image=bool(IMAGE_RE.search(part)),
@@ -226,16 +229,18 @@ def _split_h2_compound(text: str, doc_id: str, pattern: DocPattern) -> list[Chun
                 sub_content = BOILERPLATE_H.sub("", sub_content)
                 if not sub_content.strip():
                     continue
-                prefix = f"## {heading}\n### {sub_heading}\n\n"
-                prefix_tokens = _count_tokens(prefix)
+                # sub_heading is "" for the section preamble (content before
+                # the first H3): keep the H2 prefix, invent no H3 prefix.
+                sub_prefix = prefix + (f"### {sub_heading}\n\n" if sub_heading else "")
+                prefix_tokens = _count_tokens(sub_prefix)
                 budget = max(1, MAX_TOKENS - prefix_tokens)
                 overlap = min(OVERLAP_TOKENS, budget - 1)
                 parts = _split_by_tokens(sub_content, budget, overlap)
                 for part in parts:
                     chunks.append(
                         Chunk(
-                            text=f"## {heading}\n### {sub_heading}\n\n{part}",
-                            heading_path=[heading, sub_heading],
+                            text=sub_prefix + part,
+                            heading_path=base_path + ([sub_heading] if sub_heading else []),
                             chunk_index=len(chunks),
                             pattern=pattern,
                             has_image=bool(IMAGE_RE.search(part)),
@@ -357,11 +362,21 @@ def _inline_image_descriptions(md_text: str) -> str:
 
 
 def _split_by_heading(text: str, heading_re: re.Pattern) -> list[tuple[str, str]]:
-    """Divide texto por un patrón de heading → (heading, contenido)."""
+    """Divide texto por un patrón de heading → (heading, contenido).
+
+    The preamble (content before the first heading) is preserved as a
+    leading ("", preamble) entry when non-empty; callers must handle the
+    empty heading (no prefix). Before, the preamble was silently dropped —
+    for documents whose only H2s are the trailing rubric signatures, that
+    discarded the whole document body and produced zero chunks.
+    """
     positions = [(m.start(), m.group(1)) for m in heading_re.finditer(text)]
     if not positions:
         return [("", text)]
     result = []
+    preamble = text[: positions[0][0]]
+    if preamble.strip():
+        result.append(("", preamble))
     for i, (pos, heading) in enumerate(positions):
         end = positions[i + 1][0] if i + 1 < len(positions) else len(text)
         # Safe newline search: handle heading at EOF without trailing \n
