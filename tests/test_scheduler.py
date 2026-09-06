@@ -248,13 +248,18 @@ class SchedulerRecoveryTests(unittest.TestCase):
                 self.active = 0
                 self.max_active = 0
                 self.lock = threading.Lock()
+                self.first_wave = threading.Barrier(concurrency)
+                self.calls = 0
 
             def execute(self, request, *, on_progress=None):
                 with self.lock:
                     self.active += 1
+                    self.calls += 1
+                    first_wave = self.calls <= concurrency
                     self.max_active = max(self.max_active, self.active)
                 try:
-                    time.sleep(0.05)
+                    if first_wave:
+                        self.first_wave.wait(timeout=5)
                     return super().execute(request, on_progress=on_progress)
                 finally:
                     with self.lock:

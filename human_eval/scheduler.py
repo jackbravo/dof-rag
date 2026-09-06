@@ -126,11 +126,15 @@ class RunScheduler:
         *,
         model_concurrency: int = 1,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
+        fatal_shutdown_seconds: float = 30.0,
     ):
         if model_concurrency < 1:
             raise ValueError("model_concurrency must be positive")
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
+        if fatal_shutdown_seconds <= 0:
+            raise ValueError("fatal_shutdown_seconds must be positive")
+        self.fatal_shutdown_seconds = fatal_shutdown_seconds
         self.store = store
         self.executor = executor
         self.model_concurrency = model_concurrency
@@ -210,24 +214,49 @@ class RunScheduler:
         Single-use: an early stop request (for example SIGTERM during a slow
         ``prepare``) is honored instead of cleared.
         """
+        watchdog: threading.Timer | None = None
+
+        def force_exit() -> None:
+            # ThreadPoolExecutor threads also block normal interpreter exit.
+            # Skip Python cleanup so systemd sees failure and kills remaining
+            # children in the unit's cgroup before restarting. Direct launches
+            # need an external supervisor for child cleanup on this hard path.
+            os._exit(1)
+
         try:
             with ThreadPoolExecutor(
                 max_workers=self.model_concurrency,
                 thread_name_prefix="dof-human-eval-scheduler",
             ) as self._pool:
-                while not self._stopping.is_set():
-                    if self.poll_once() == 0:
-                        self._stopping.wait(self.poll_seconds)
+                try:
+                    while not self._stopping.is_set():
+                        if self.poll_once() == 0:
+                            self._stopping.wait(self.poll_seconds)
+                except BaseException as exc:
+                    self._fatal = exc
+                    raise
+                finally:
+                    if self._fatal is not None:
+                        # Arm before the pool context starts waiting. Unlike a
+                        # signal-driven stop, an internal failure does not start
+                        # systemd's TimeoutStopSec countdown.
+                        watchdog = threading.Timer(
+                            self.fatal_shutdown_seconds, force_exit
+                        )
+                        watchdog.daemon = True
+                        watchdog.start()
         finally:
             self._pool = None
-            # Drain the pool before closing the executor, even if polling raises.
-            # A hung call is bounded by the supervisor's stop timeout.
-            close = getattr(self.executor, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    LOGGER.exception("executor shutdown hook failed")
+            try:
+                close = getattr(self.executor, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        LOGGER.exception("executor shutdown hook failed")
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
         if self._fatal is not None:
             raise RuntimeError(
                 "scheduler stopped after an execution persistence failure"

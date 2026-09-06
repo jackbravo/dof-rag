@@ -253,6 +253,20 @@ posición en la cola y una espera aproximada mientras la pregunta espera.
   y `dof-human-eval-web.service` (`Restart=always`; al detenerse, systemd acota
   el drenaje con `TimeoutStopSec` y, si hace falta, termina todo el grupo de
   procesos con SIGKILL, incluido el servidor de embeddings).
+  Ante un error interno fatal, el scheduler permite hasta 30 segundos de
+  drenaje y limpieza antes de forzar una salida con error: así systemd puede
+  limpiar los procesos hijos y reiniciar aunque una llamada al modelo no termine.
+  Esta salida forzada requiere supervisión externa para limpiar hijos cuando
+  se ejecuta fuera de systemd.
+- Reejecutar el instalador no reinicia servicios activos. Después de actualizar
+  código o unidades, aplica los cambios explícitamente, deteniendo primero la
+  admisión web:
+
+  ```bash
+  systemctl --user stop dof-human-eval-web.service
+  systemctl --user restart dof-human-eval-scheduler.service
+  systemctl --user start dof-human-eval-web.service
+  ```
 
 - Visitantes anónimos leen las respuestas publicadas. Con cuenta: 1 pregunta cada 24 h (`DOF_DAILY_QUESTION_LIMIT`) y hay que evaluar una respuesta publicada antes de cada pregunta, incluida la primera. Los administradores publican y despublican en `/admin/queue` (rol vía `public_metadata.role = "admin"` en el dashboard de Clerk).
 - Recuperación híbrida para preguntas en vivo: `DOF_RETRIEVAL_MODE=hybrid` (requiere el índice vec0 y `DOF_GGUF_MODEL`; el servidor de embeddings llama-server lo levanta una sola vez el scheduler, con `DOF_EMBED_PORT`, por defecto 8086).

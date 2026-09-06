@@ -1,7 +1,10 @@
 """Regression tests for scheduler cleanup, duration sampling, and seed paths."""
 
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +16,43 @@ from scripts import seed_human_eval_v4_hybrid as seed
 
 
 class SchedulerCleanupTests(unittest.TestCase):
+    def test_signal_stop_does_not_arm_fatal_watchdog(self):
+        scheduler = RunScheduler(mock.Mock(), mock.Mock())
+        scheduler.stop()
+        with mock.patch("human_eval.scheduler.threading.Timer") as timer:
+            scheduler.run()
+        timer.assert_not_called()
+        scheduler.executor.close.assert_called_once()
+
+    def test_fatal_errors_force_process_exit_with_hung_work(self):
+        for failure in ("poll", "persistence"):
+            with self.subTest(failure=failure):
+                program = textwrap.dedent('''
+                    import threading
+                    from unittest import mock
+                    from human_eval.scheduler import RunScheduler
+
+                    scheduler = RunScheduler(
+                        mock.Mock(), mock.Mock(), fatal_shutdown_seconds=0.1
+                    )
+                    def poll():
+                        scheduler._pool.submit(threading.Event().wait)
+                        if FAILURE == "poll":
+                            raise RuntimeError("poll failed")
+                        from concurrent.futures import Future
+                        failed = Future()
+                        failed.set_exception(RuntimeError("persistence failed"))
+                        scheduler._in_flight.add(failed)
+                        return RunScheduler.poll_once(scheduler)
+                    scheduler.poll_once = poll
+                    scheduler.run()
+                ''').replace("FAILURE", repr(failure))
+                result = subprocess.run(
+                    [sys.executable, "-c", program],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_poll_errors_drain_work_before_closing_executor(self):
         for source in ("queue_depth", "provenance", "claim_next_run"):
             with self.subTest(source=source):
@@ -37,6 +77,33 @@ class SchedulerCleanupTests(unittest.TestCase):
                 executor.close.assert_called_once()
                 self.assertEqual(closed_after, [True])
                 self.assertIsNone(scheduler._pool)
+
+
+class WebWorkerStartupTests(unittest.TestCase):
+    def test_multiple_workers_use_factory_and_propagate_root(self):
+        from human_eval import app
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("sys.argv", ["app", "--workers", "2", "--repo-root", directory]),
+                mock.patch.object(app, "uvicorn") as uvicorn,
+                mock.patch.object(app, "WebSettings") as settings,
+                mock.patch.object(app, "build_default_app") as build,
+            ):
+                settings.from_env.return_value = mock.Mock(host="127.0.0.1", port=8000)
+                self.assertEqual(app.main(), 0)
+                settings.from_env.assert_called_once_with(root)
+                self.assertEqual(os.environ["DOF_APP_REPO_ROOT"], str(root))
+                uvicorn.run.assert_called_once_with(
+                    "human_eval.app:create_uvicorn_app", factory=True,
+                    workers=2, host="127.0.0.1", port=8000, access_log=False,
+                )
+                build.assert_not_called()
+                build.return_value = (mock.sentinel.app, mock.sentinel.settings)
+                self.assertIs(app.create_uvicorn_app(), mock.sentinel.app)
+                build.assert_called_once_with(root)
 
 
 class DurationSamplingTests(unittest.TestCase):
