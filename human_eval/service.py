@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -21,6 +22,7 @@ from .store import (
     EvaluationStore,
     IdempotencyPayloadConflict,
     QueueCapacityConflict,
+    ReviewRequiredConflict,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -83,13 +85,25 @@ class EvaluationService:
         self._lifecycle_lock = threading.Lock()
         self._started = False
 
-    def start(self) -> None:
+    def start(self, *, schema_wait_seconds: float = 0.0) -> None:
+        if schema_wait_seconds < 0:
+            raise ValueError("schema_wait_seconds must not be negative")
         with self._lifecycle_lock:
             if self._started:
                 return
-            # Web workers validate but never migrate; the scheduler owns the
-            # schema, so a migration can never race web startup.
-            self.store.validate_schema()
+            # Web workers validate but never migrate. Under systemd, After=
+            # orders process starts but Type=simple does not wait for the
+            # scheduler's prepare(), so allow a bounded readiness wait.
+            deadline = time.monotonic() + schema_wait_seconds
+            while True:
+                try:
+                    self.store.validate_schema()
+                    break
+                except RuntimeError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(0.1, remaining))
             self._started = True
 
     def close(self) -> None:
@@ -104,54 +118,28 @@ class EvaluationService:
         admin: bool = False,
         daily_question_limit: int = 1,
     ) -> dict[str, Any]:
-        # create_run performs the admission checks in one SQLite transaction;
-        # the checks below only produce nicer errors without paying for a
-        # transaction first. The transactional checks are authoritative
-        # across all web processes.
+        # create_run checks idempotency first and performs every admission
+        # decision in one SQLite transaction. No preliminary rejection is
+        # safe here: another web process could commit the same idempotency key
+        # between a lookup and that rejection.
         with self._lifecycle_lock:
             if not self._started:
                 raise RuntimeError("service has not started")
-            existing = self.idempotent_run(request, user_id=user_id)
-            if existing is not None:
-                return existing
-            if self.store.has_active_run(user_id):
-                LOGGER.warning(
-                    "admission rejected: active run exists (depth=%s, capacity=%s)",
-                    self.store.queue_depth(),
-                    self.queue_capacity,
-                )
-                raise ActiveRunError("user already has an active run")
             daily_since: str | None = None
             if not admin:
-                if not self.store.has_review_since_last_submission(user_id):
-                    raise ReviewRequiredError(
-                        "a published-answer review is required before asking"
-                    )
                 if daily_question_limit >= 1:
                     daily_since = (
                         (datetime.now(timezone.utc) - timedelta(hours=24))
                         .isoformat()
                         .replace("+00:00", "Z")
                     )
-                    if (
-                        self.store.count_submissions_since(user_id, daily_since)
-                        >= daily_question_limit
-                    ):
-                        raise QuotaExceededError("daily question limit reached")
-            queue_depth = self.store.queue_depth()
-            if queue_depth >= self.queue_capacity:
-                LOGGER.warning(
-                    "admission rejected: queue full (depth=%s, capacity=%s)",
-                    queue_depth,
-                    self.queue_capacity,
-                )
-                raise QueueFullError("execution queue is full")
             try:
-                run, created = self.store.create_run(
+                run, _ = self.store.create_run(
                     request,
                     user_id=user_id,
                     provenance=None,
                     enforce_active_run=True,
+                    require_review=not admin,
                     queue_capacity=self.queue_capacity,
                     daily_question_limit=(
                         daily_question_limit
@@ -176,32 +164,15 @@ class EvaluationService:
                 raise QueueFullError("execution queue is full") from exc
             except DailyQuotaConflict as exc:
                 raise QuotaExceededError("daily question limit reached") from exc
+            except ReviewRequiredConflict as exc:
+                raise ReviewRequiredError(
+                    "a published-answer review is required before asking"
+                ) from exc
             except IdempotencyPayloadConflict as exc:
                 raise IdempotencyConflictError(
                     "client_request_id was already used for a different request"
                 ) from exc
-            if not created:
-                # Another web process won the idempotency race.
-                return self.public_run(run["run_id"], user_id=user_id, admin=True)
             return self.public_run(run["run_id"], user_id=user_id, admin=True)
-
-    def idempotent_run(
-        self, request: RunRequest, *, user_id: str
-    ) -> dict[str, Any] | None:
-        existing = self.store.find_idempotent_run(user_id, request.client_request_id)
-        if existing is None:
-            return None
-        if any(
-            (
-                existing["question"] != request.question,
-                existing["as_of"] != request.as_of,
-                existing["required_hops"] != request.required_hops,
-            )
-        ):
-            raise IdempotencyConflictError(
-                "client_request_id was already used for a different request"
-            )
-        return self.public_run(existing["run_id"], user_id=user_id, admin=True)
 
     def public_run(
         self,

@@ -391,7 +391,8 @@ uv run python -m human_eval.app --workers 2
 
 En el servidor de producción ambos procesos se instalan como servicios
 systemd de usuario con `scripts/install_human_eval_systemd.sh` (el scheduler
-arranca primero: migra la base antes de que los procesos web la validen).
+arranca primero y los procesos web esperan hasta `DOF_SCHEMA_WAIT_SECONDS`, 30
+segundos por defecto, a que termine de preparar el esquema).
 
 La recuperación por defecto es léxica. El scheduler único evita competir
 agresivamente con la indexación en curso. Antes del piloto externo faltan el

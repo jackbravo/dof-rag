@@ -79,11 +79,7 @@ def acquire_execution_lock(db_path: str | Path) -> int:
 def execute_claimed_run(
     store: EvaluationStore, executor: RunExecutor, run_id: str
 ) -> None:
-    """Execute one already-started run and persist its terminal state.
-
-    Shared by the scheduler pool and the seed script (which acts as the
-    scheduler while holding the execution lock).
-    """
+    """Execute one scheduler-claimed run and persist its terminal state."""
     request = store.get_request(run_id)
     if request is None:
         LOGGER.warning("claimed run %s vanished before execution", run_id)
@@ -178,11 +174,19 @@ class RunScheduler:
             # supervisor restart this process (systemd Restart=always).
             self._stopping.set()
             return 0
+        if self._stopping.is_set():
+            return 0
+        # Poll SQLite first so an idle scheduler does not run the much more
+        # expensive git and index provenance probes every poll interval. New
+        # arrivals after this snapshot wait at most one interval.
+        available = min(
+            self.model_concurrency - len(self._in_flight),
+            self.store.queue_depth(),
+        )
         claimed = 0
-        while (
-            not self._stopping.is_set()
-            and len(self._in_flight) < self.model_concurrency
-        ):
+        for _ in range(available):
+            if self._stopping.is_set():
+                break
             provenance = self.executor.provenance()
             if self._stopping.is_set():
                 # provenance() runs git and index probes; a stop requested

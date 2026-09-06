@@ -98,6 +98,7 @@ class WebSettings:
     daily_question_limit: int = 1
     queue_capacity: int = 20
     model_concurrency: int = 1
+    schema_wait_seconds: float = 0.0
 
     @classmethod
     def from_env(cls, repo_root: Path) -> "WebSettings":
@@ -131,6 +132,11 @@ class WebSettings:
             # Display-only mirror of the scheduler's real limit; share one
             # environment file so both sides normally agree.
             model_concurrency=int(os.environ.get("DOF_MODEL_CONCURRENCY", "1")),
+            # systemd Type=simple only orders process launches. On a fresh
+            # database, give the scheduler time to finish schema preparation.
+            schema_wait_seconds=float(
+                os.environ.get("DOF_SCHEMA_WAIT_SECONDS", "30")
+            ),
         )
 
 
@@ -1086,7 +1092,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: Any):
-        service.start()
+        service.start(schema_wait_seconds=settings.schema_wait_seconds)
         try:
             yield
         finally:

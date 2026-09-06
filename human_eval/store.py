@@ -39,6 +39,10 @@ class DailyQuotaConflict(RuntimeError):
     """The user has reached the configured rolling question limit."""
 
 
+class ReviewRequiredConflict(RuntimeError):
+    """The user must review an answer before submitting another question."""
+
+
 class IdempotencyPayloadConflict(RuntimeError):
     """An idempotency key was reused for a different request payload."""
 
@@ -216,6 +220,7 @@ class EvaluationStore:
         user_id: str,
         provenance: dict[str, Any] | None = None,
         enforce_active_run: bool = False,
+        require_review: bool = False,
         queue_capacity: int | None = None,
         daily_question_limit: int | None = None,
         daily_since: str | None = None,
@@ -261,6 +266,15 @@ class EvaluationStore:
                 ).fetchone()
                 if active:
                     raise ActiveRunConflict(user_id)
+            if require_review:
+                reviewed = connection.execute(
+                    "SELECT 1 FROM feedback f WHERE f.user_id = ? "
+                    "AND f.created_at > COALESCE((SELECT MAX(r.created_at) "
+                    "FROM runs r WHERE r.user_id = ?), '') LIMIT 1",
+                    (user_id, user_id),
+                ).fetchone()
+                if reviewed is None:
+                    raise ReviewRequiredConflict(user_id)
             if daily_question_limit is not None:
                 submissions = connection.execute(
                     "SELECT COUNT(*) FROM runs WHERE user_id = ? AND created_at >= ?",

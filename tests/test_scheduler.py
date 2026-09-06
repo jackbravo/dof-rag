@@ -99,6 +99,16 @@ class WebStartupTests(unittest.TestCase):
         service.start()
         service.close()
 
+    def test_web_startup_can_wait_for_scheduler_schema_preparation(self):
+        store = mock.Mock()
+        store.validate_schema.side_effect = [RuntimeError("not ready"), None]
+        service = EvaluationService(store)
+        with mock.patch("human_eval.service.time.sleep") as sleep:
+            service.start(schema_wait_seconds=1)
+        self.assertEqual(store.validate_schema.call_count, 2)
+        sleep.assert_called_once()
+        service.close()
+
 
 class SchedulerRecoveryTests(unittest.TestCase):
     def setUp(self):
@@ -158,6 +168,31 @@ class SchedulerRecoveryTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             # Not public and not owned by this user.
             service.public_run(run["run_id"], user_id="other")
+
+    def test_idle_scheduler_does_not_snapshot_provenance(self):
+        class CountingExecutor(FakeExecutor):
+            def __init__(self):
+                self.provenance_calls = 0
+
+            def provenance(self):
+                self.provenance_calls += 1
+                return super().provenance()
+
+        executor = CountingExecutor()
+        scheduler, thread = start_scheduler(self.store, executor)
+        try:
+            time.sleep(0.08)
+            self.assertEqual(executor.provenance_calls, 0)
+
+            service = EvaluationService(self.store)
+            service.start()
+            run = service.submit(RunRequest("pregunta"), user_id="one", admin=True)
+            self.assertEqual(
+                wait_for_terminal(service, run["run_id"])["status"], "succeeded"
+            )
+            self.assertEqual(executor.provenance_calls, 1)
+        finally:
+            stop_scheduler(scheduler, thread)
 
     def test_stop_halts_new_claims_and_drains_in_flight(self):
         executor = BlockingExecutor()
@@ -287,6 +322,48 @@ class CrossProcessAdmissionTests(unittest.TestCase):
                     user_id="user",
                     admin=True,
                 )
+
+    def test_same_idempotency_retry_wins_over_admission_rejections(self):
+        first = EvaluationService(self.store, queue_capacity=1)
+        second = EvaluationService(
+            EvaluationStore(self.store.path), queue_capacity=1
+        )
+        first.start()
+        second.start()
+        request = RunRequest("original", client_request_id="shared-key")
+        created = first.submit(request, user_id="user", admin=True)
+
+        # A preflight lookup could miss a concurrent winner and let the
+        # active-run or queue checks reject this retry. Admission must instead
+        # enter create_run's transaction, where idempotency is checked first.
+        with mock.patch.object(
+            second.store, "find_idempotent_run", return_value=None
+        ) as preflight_lookup:
+            repeated = second.submit(request, user_id="user", admin=True)
+
+        preflight_lookup.assert_not_called()
+        self.assertEqual(repeated["run_id"], created["run_id"])
+
+    def test_same_idempotency_retry_wins_over_review_and_quota(self):
+        first = EvaluationService(self.store)
+        second = EvaluationService(EvaluationStore(self.store.path))
+        first.start()
+        second.start()
+        request = RunRequest("original", client_request_id="shared-key")
+        created = first.submit(request, user_id="user", admin=True)
+        self.store.append_event(created["run_id"], "started")
+        self.store.append_event(created["run_id"], "succeeded", {"answer": {}})
+
+        # The successful submission consumed both the review gate and daily
+        # quota. An identical retry must still return it instead of being
+        # treated as a new question.
+        with mock.patch.object(
+            second.store, "find_idempotent_run", return_value=None
+        ) as preflight_lookup:
+            repeated = second.submit(request, user_id="user", admin=False)
+
+        preflight_lookup.assert_not_called()
+        self.assertEqual(repeated["run_id"], created["run_id"])
 
 
 class QueuePresentationTests(unittest.TestCase):

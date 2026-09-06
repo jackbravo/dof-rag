@@ -246,7 +246,8 @@ posición en la cola y una espera aproximada mientras la pregunta espera.
   con `--workers N` sin duplicar modelos.
 - Los procesos web validan el esquema de la base pero nunca lo migran: el
   scheduler (o la semilla, bajo el mismo seguro) es el único migrador. Arranca
-  el scheduler antes que los procesos web.
+  el scheduler antes que los procesos web; éstos esperan hasta 30 segundos por
+  defecto (`DOF_SCHEMA_WAIT_SECONDS`) mientras termina la preparación inicial.
 - En producción ambos procesos corren como servicios systemd de usuario:
   `scripts/install_human_eval_systemd.sh` instala `dof-human-eval-scheduler.service`
   y `dof-human-eval-web.service` (`Restart=always`; al detenerse, systemd acota

@@ -6,8 +6,8 @@ After=network-online.target dof-human-eval-scheduler.service
 [Service]
 Type=simple
 # Web workers only admit and read runs; the scheduler process executes
-# them. Start the scheduler first so it initializes/migrates the database
-# before web workers validate it.
+# them. The scheduler is launched first, and web workers wait up to
+# DOF_SCHEMA_WAIT_SECONDS (30 seconds by default) for schema preparation.
 ExecStart=@DOF_REPO_DIR@/.venv/bin/python -m human_eval.app --workers 2
 WorkingDirectory=@DOF_REPO_DIR@
 EnvironmentFile=-@DOF_REPO_DIR@/.env
