@@ -86,8 +86,8 @@ class EvaluationService:
         self._started = False
 
     def start(self, *, schema_wait_seconds: float = 0.0) -> None:
-        if schema_wait_seconds < 0:
-            raise ValueError("schema_wait_seconds must not be negative")
+        if not 0 <= schema_wait_seconds < float("inf"):
+            raise ValueError("schema_wait_seconds must be finite and non-negative")
         with self._lifecycle_lock:
             if self._started:
                 return
