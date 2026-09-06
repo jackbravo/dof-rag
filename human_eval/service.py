@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import time
 import uuid
@@ -69,6 +70,14 @@ class ReviewRequiredError(RuntimeError):
 DEFAULT_RUN_SECONDS = 480.0
 DEFAULT_LEASE_SECONDS = 120.0
 DEFAULT_POLL_SECONDS = 0.25
+
+
+def _retryable_store_error(error: sqlite3.OperationalError) -> bool:
+    # Extended SQLite result codes retain the primary code in the low byte.
+    code = getattr(error, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in {
+        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED
+    }
 
 
 class EvaluationService:
@@ -372,13 +381,22 @@ class EvaluationService:
                 except queue.Empty:
                     notification = "__poll__"
                 try:
-                    if notification is None or self._closing.is_set():
-                        return
-                    claim = self.store.claim_next_run(
-                        worker_id=self.worker_id,
-                        concurrency=self.model_concurrency,
-                        lease_seconds=self.lease_seconds,
-                    )
+                    with self._write_lock:
+                        if notification is None or self._closing.is_set():
+                            return
+                        claim = self.store.claim_next_run(
+                            worker_id=self.worker_id,
+                            concurrency=self.model_concurrency,
+                            lease_seconds=self.lease_seconds,
+                            # Do not hold the lifecycle write lock through a
+                            # full default SQLite busy timeout. Poll retries
+                            # let shutdown and event writes make progress.
+                            timeout=min(
+                                DEFAULT_POLL_SECONDS,
+                                self.lease_seconds / 3,
+                                self.shutdown_timeout,
+                            ),
+                        )
                     if claim is None:
                         continue
                     run_id, slot_id = claim
@@ -445,6 +463,13 @@ class EvaluationService:
                                 slot_id=slot_id,
                                 worker_id=self.worker_id,
                             )
+                except sqlite3.OperationalError as exc:
+                    if not _retryable_store_error(exc):
+                        raise
+                    LOGGER.warning("scheduler store busy; retrying", exc_info=True)
+                    # Claims remain persisted if a later operation failed;
+                    # expired claims are recovered by the next claim attempt.
+                    self._closing.wait(DEFAULT_POLL_SECONDS)
                 finally:
                     if notification != "__poll__":
                         self.queue.task_done()
@@ -461,17 +486,45 @@ class EvaluationService:
         self, stop: threading.Event, run_id: str, slot_id: int
     ) -> None:
         interval = self.lease_seconds / 3
-        while not stop.wait(interval):
+        deadline = time.monotonic() + self.lease_seconds
+        delay = interval
+        backoff = min(0.05, interval)
+        while not stop.wait(delay):
             if self._closing.is_set():
                 return
-            if not self.store.renew_model_slot(
-                run_id=run_id,
-                slot_id=slot_id,
-                worker_id=self.worker_id,
-                lease_seconds=self.lease_seconds,
-            ):
+            attempt_started = time.monotonic()
+            remaining = deadline - attempt_started
+            if remaining <= 0:
+                LOGGER.warning("model lease retry deadline reached for run %s", run_id)
+                return
+            try:
+                renewed = self.store.renew_model_slot(
+                    run_id=run_id,
+                    slot_id=slot_id,
+                    worker_id=self.worker_id,
+                    lease_seconds=self.lease_seconds,
+                    timeout=min(DEFAULT_POLL_SECONDS, remaining),
+                )
+            except sqlite3.OperationalError as exc:
+                if not _retryable_store_error(exc):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    LOGGER.warning("model lease retry deadline reached for run %s", run_id)
+                    return
+                LOGGER.warning("model lease store busy for run %s; retrying", run_id)
+                delay = min(backoff, remaining)
+                backoff = min(backoff * 2, interval, 1.0)
+                continue
+            if not renewed:
                 LOGGER.warning("lost model lease for run %s", run_id)
                 return
+            # Start the local budget before renewal, conservatively excluding
+            # time spent acquiring SQLite's lock. The store also fences every
+            # renewal by the authoritative, unexpired database deadline.
+            deadline = attempt_started + self.lease_seconds
+            delay = interval
+            backoff = min(0.05, interval)
 
     def _close_executor(self) -> None:
         # If shutdown timed out while a run was active, the worker calls this

@@ -128,14 +128,14 @@ class EvaluationStore:
         self.path = Path(path)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, timeout: float = 30) -> Iterator[sqlite3.Connection]:
         """Open one connection for an operation and always close it."""
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = sqlite3.connect(self.path, timeout=timeout)
         try:
             with connection:
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA busy_timeout = 30000")
+                connection.execute(f"PRAGMA busy_timeout = {max(0, int(timeout * 1000))}")
                 yield connection
         finally:
             connection.close()
@@ -361,11 +361,12 @@ class EvaluationStore:
         worker_id: str,
         concurrency: int,
         lease_seconds: float,
+        timeout: float = 30,
     ) -> tuple[str, int] | None:
         """Atomically claim the oldest queued run and one model slot."""
         if concurrency < 1 or lease_seconds <= 0:
             raise ValueError("invalid scheduler limits")
-        with self._connect() as connection:
+        with self._connect(timeout=timeout) as connection:
             connection.execute("BEGIN IMMEDIATE")
             # A busy SQLite writer may have delayed this transaction. Start
             # the lease only after the write lock is actually ours.
@@ -418,10 +419,11 @@ class EvaluationStore:
         slot_id: int,
         worker_id: str,
         lease_seconds: float,
+        timeout: float = 30,
     ) -> bool:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        with self._connect() as connection:
+        with self._connect(timeout=timeout) as connection:
             connection.execute("BEGIN IMMEDIATE")
             # Calculate under the write lock so lock contention cannot consume
             # some or all of the renewed lease before the UPDATE commits.
