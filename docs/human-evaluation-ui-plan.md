@@ -377,19 +377,25 @@ proveedor.
 Configuración mínima, con valores de ejemplo que no deben guardarse en Git:
 
 ```bash
-export DOF_EVALUATOR_TOKENS='token-individual-1,token-individual-2'
+export CLERK_SECRET_KEY='sk_test_...'  # y CLERK_PUBLISHABLE_KEY para airclerk
 export DOF_SESSION_SECRET='valor-aleatorio-de-al-menos-32-caracteres'
 export DOF_ALLOWED_HOSTS='localhost,127.0.0.1,piloto.example'
 export DOF_SECURE_COOKIE='true'
 export DOF_AGENT_PROVIDER='openai-responses'
 export DOF_AGENT_MODEL='modelo-configurado-en-backend'
 export OPENAI_API_KEY='...'
-uv run python -m human_eval.app
+# Dos procesos: el scheduler ejecuta y los procesos web admiten y sirven la UI.
+uv run python -m human_eval.scheduler &
+uv run python -m human_eval.app --workers 2
 ```
+
+En el servidor de producción ambos procesos se instalan como servicios
+systemd de usuario con `scripts/install_human_eval_systemd.sh` (el scheduler
+arranca primero: migra la base antes de que los procesos web la validen).
 
 La recuperación por defecto es léxica. El scheduler único evita competir
 agresivamente con la indexación en curso. Antes del piloto externo faltan el
-supervisor local, el túnel HTTPS y un procedimiento de backup de
+túnel HTTPS y un procedimiento de backup de
 `var/human_evaluation.sqlite`; el corpus y los índices siguen siendo
 dependencias de solo lectura con su propio ciclo de respaldo.
 

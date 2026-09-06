@@ -183,7 +183,12 @@ class RunScheduler:
             not self._stopping.is_set()
             and len(self._in_flight) < self.model_concurrency
         ):
-            run_id = self.store.claim_next_run(provenance=self.executor.provenance())
+            provenance = self.executor.provenance()
+            if self._stopping.is_set():
+                # provenance() runs git and index probes; a stop requested
+                # during that work must still prevent the claim.
+                break
+            run_id = self.store.claim_next_run(provenance=provenance)
             if run_id is None:
                 break
             claimed += 1

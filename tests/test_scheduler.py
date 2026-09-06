@@ -439,3 +439,28 @@ class SchedulerFailureTests(unittest.TestCase):
         scheduler.stop()
         scheduler.run()
         self.assertEqual(self.store.get_run(run["run_id"])["status"], "queued")
+
+    def test_stop_during_provenance_prevents_the_claim(self):
+        class SlowProvenanceExecutor(FakeExecutor):
+            def __init__(self):
+                self.inside = threading.Event()
+                self.release = threading.Event()
+
+            def provenance(self):
+                self.inside.set()
+                if not self.release.wait(3):
+                    raise RuntimeError("test provenance barrier timed out")
+                return super().provenance()
+
+        executor = SlowProvenanceExecutor()
+        scheduler, thread = start_scheduler(self.store, executor)
+        service = EvaluationService(self.store)
+        service.start()
+        run = service.submit(RunRequest("pregunta"), user_id="one", admin=True)
+        self.assertTrue(executor.inside.wait(1))
+        # SIGTERM arrives while provenance runs its git and index probes.
+        scheduler.stop()
+        executor.release.set()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.store.get_run(run["run_id"])["status"], "queued")
