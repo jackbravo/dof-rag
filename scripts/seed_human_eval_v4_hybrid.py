@@ -71,13 +71,16 @@ def seed_live_run(
         else:
             # Do not delete a queued/running run owned by another process.
             return "pending"
+    # Probe before persisting work so a provenance failure cannot strand a
+    # queued seed run outside this script's execution/publishing flow.
+    provenance = executor.provenance()
     record, created = store.create_run(request, user_id=SEED_USER)
     if not created:
         return "skipped"
     run_id = record["run_id"]
     # The seed script holds the execution lock and acts as the scheduler:
     # stamp provenance atomically with the started transition.
-    store.start_run(run_id, provenance=executor.provenance())
+    store.start_run(run_id, provenance=provenance)
     try:
         result = executor.execute(
             request,

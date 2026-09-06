@@ -67,6 +67,25 @@ class DurationSamplingTests(unittest.TestCase):
 
 
 class SeedDatabaseTests(unittest.TestCase):
+    def test_provenance_failure_does_not_persist_seed_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EvaluationStore(Path(directory) / "eval.sqlite")
+            store.initialize()
+            executor = mock.Mock()
+            executor.provenance.side_effect = RuntimeError("probe failed")
+            item = {"id": "probe-test", "question": "question"}
+            # Repeated attempts must retry the probe, not return 'pending'.
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                    seed.seed_live_run(store, executor, item, publish=True)
+                self.assertIsNone(
+                    store.find_idempotent_run(
+                        seed.SEED_USER, "eval-v4-hybrid:probe-test"
+                    )
+                )
+                self.assertEqual(store.queue_depth(), 0)
+            executor.execute.assert_not_called()
+
     def test_database_precedence_matches_lock_and_store(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
