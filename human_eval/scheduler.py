@@ -137,6 +137,7 @@ class RunScheduler:
         self.model_concurrency = model_concurrency
         self.poll_seconds = poll_seconds
         self._stopping = threading.Event()
+        self._fatal: BaseException | None = None
         self._in_flight: set[Any] = set()
         self._pool: ThreadPoolExecutor | None = None
 
@@ -168,7 +169,15 @@ class RunScheduler:
                         future.exception().__traceback__,
                     ),
                 )
+                if self._fatal is None:
+                    self._fatal = future.exception()
         self._in_flight -= done
+        if self._fatal is not None:
+            # A persistence failure stranded its run in 'started' and only
+            # startup recovery can repair that, so stop claiming and let the
+            # supervisor restart this process (systemd Restart=always).
+            self._stopping.set()
+            return 0
         claimed = 0
         while (
             not self._stopping.is_set()
@@ -184,8 +193,11 @@ class RunScheduler:
         return claimed
 
     def run(self) -> None:
-        """Supervise the queue until ``stop`` is requested, then drain."""
-        self._stopping.clear()
+        """Supervise the queue until ``stop`` or a fatal persistence error.
+
+        Single-use: an early stop request (for example SIGTERM during a slow
+        ``prepare``) is honored instead of cleared.
+        """
         with ThreadPoolExecutor(
             max_workers=self.model_concurrency,
             thread_name_prefix="dof-human-eval-scheduler",
@@ -204,6 +216,10 @@ class RunScheduler:
                 close()
             except Exception:
                 LOGGER.exception("executor shutdown hook failed")
+        if self._fatal is not None:
+            raise RuntimeError(
+                "scheduler stopped after an execution persistence failure"
+            ) from self._fatal
 
     def stop(self) -> None:
         self._stopping.set()

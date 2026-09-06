@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -393,3 +394,48 @@ class QueuePresentationAppTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn("Posición en la cola: 1", page.text)
         self.assertIn("0 de 1 slots ocupados", page.text)
+
+
+class SchedulerFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.store = EvaluationStore(Path(self.tempdir.name) / "evaluation.sqlite")
+        self.store.initialize()
+
+    def test_persistence_failure_stops_scheduler_for_supervised_restart(self):
+        scheduler, thread = start_scheduler(self.store, FakeExecutor())
+        service = EvaluationService(self.store)
+        service.start()
+        # A terminal write that cannot persist strands the run in 'started';
+        # only startup recovery repairs that, so the scheduler must stop and
+        # let the supervisor (systemd Restart=always) restart it.
+        with mock.patch.object(
+            self.store,
+            "append_event",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            run = service.submit(RunRequest("pregunta"), user_id="one", admin=True)
+            thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.store.get_run(run["run_id"])["status"], "running")
+
+        replacement, replacement_thread = start_scheduler(self.store, FakeExecutor())
+        try:
+            recovered = self.store.get_run(run["run_id"])
+            self.assertEqual(recovered["status"], "failed")
+            self.assertEqual(recovered["error"]["code"], "service_restarted")
+        finally:
+            stop_scheduler(replacement, replacement_thread)
+
+    def test_stop_requested_during_prepare_is_honored(self):
+        scheduler = RunScheduler(self.store, FakeExecutor(), poll_seconds=0.02)
+        scheduler.prepare()
+        service = EvaluationService(self.store)
+        service.start()
+        run = service.submit(RunRequest("pregunta"), user_id="one", admin=True)
+        # SIGTERM can arrive while prepare() (embedding-server startup) is
+        # still running; run() must not erase that stop request.
+        scheduler.stop()
+        scheduler.run()
+        self.assertEqual(self.store.get_run(run["run_id"])["status"], "queued")

@@ -17,10 +17,11 @@ EnvironmentFile=-@DOF_REPO_DIR@/.env
 Restart=always
 RestartSec=2
 # SIGTERM stops new claims and lets in-flight runs finish within this
-# window; systemd then SIGKILLs the whole control group, including the
-# embedding-server child process.
+# window; it goes only to the scheduler so a managed embedding server keeps
+# serving in-flight hybrid runs during the drain, then SIGKILL reaches every
+# remaining process in the control group.
 TimeoutStopSec=30
-KillMode=control-group
+KillMode=mixed
 StandardOutput=append:@DOF_REPO_DIR@/logs/human-eval-scheduler.log
 StandardError=append:@DOF_REPO_DIR@/logs/human-eval-scheduler.error.log
 

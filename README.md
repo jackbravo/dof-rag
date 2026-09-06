@@ -250,8 +250,8 @@ posición en la cola y una espera aproximada mientras la pregunta espera.
 - En producción ambos procesos corren como servicios systemd de usuario:
   `scripts/install_human_eval_systemd.sh` instala `dof-human-eval-scheduler.service`
   y `dof-human-eval-web.service` (`Restart=always`; al detenerse, systemd acota
-  el drenaje con `TimeoutStopSec` y termina todo el grupo de procesos, incluido
-  el servidor de embeddings).
+  el drenaje con `TimeoutStopSec` y, si hace falta, termina todo el grupo de
+  procesos con SIGKILL, incluido el servidor de embeddings).
 
 - Visitantes anónimos leen las respuestas publicadas. Con cuenta: 1 pregunta cada 24 h (`DOF_DAILY_QUESTION_LIMIT`) y hay que evaluar una respuesta publicada antes de cada pregunta, incluida la primera. Los administradores publican y despublican en `/admin/queue` (rol vía `public_metadata.role = "admin"` en el dashboard de Clerk).
 - Recuperación híbrida para preguntas en vivo: `DOF_RETRIEVAL_MODE=hybrid` (requiere el índice vec0 y `DOF_GGUF_MODEL`; el servidor de embeddings llama-server lo levanta una sola vez el scheduler, con `DOF_EMBED_PORT`, por defecto 8086).

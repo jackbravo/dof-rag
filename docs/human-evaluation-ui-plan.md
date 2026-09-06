@@ -40,7 +40,9 @@ Incluye:
 - snapshot por ejecución de código, corpus, chunks, índice, modelo y
   configuración;
 - historial reciente del mismo evaluador;
-- operación inicial desde la MacBook Pro actual con un scheduler único.
+- operación inicial desde el servidor de producción del proyecto con un
+  scheduler único; la MacBook Pro actual queda como entorno de desarrollo y
+  benchmark.
 
 ## Fuera del MVP
 
@@ -363,11 +365,14 @@ incompleta; continúa siendo evaluable.
 
 ## Despliegue previsto
 
-El MVP se ejecutará en la MacBook Pro actual, ligado inicialmente a
-`127.0.0.1:8765`. La UI y el backend se publican como una sola app ASGI. Para
-pruebas humanas remotas se colocará delante un túnel o reverse proxy HTTPS que
-termine TLS, limite cuerpos, no almacene en buffer SSE y use un hostname estable;
-todavía debe elegirse el proveedor.
+La MacBook Pro actual es un entorno de desarrollo y benchmark; el despliegue
+operativo corre en la máquina de servidor configurada para el proyecto. La UI
+vive en uno o varios procesos web y la ejecución en un scheduler singleton,
+ambos supervisados como servicios systemd de usuario (`ops/systemd/`), ligados
+inicialmente a `127.0.0.1:8765`. Para pruebas humanas remotas se colocará
+delante un túnel o reverse proxy HTTPS que termine TLS, limite cuerpos, no
+almacene en buffer SSE y use un hostname estable; todavía debe elegirse el
+proveedor.
 
 Configuración mínima, con valores de ejemplo que no deben guardarse en Git:
 
@@ -509,10 +514,11 @@ La procedencia separa `vector_available` (el artefacto existe en disco) de
 - Air sigue evolucionando y la versión compatible con Python 3.12 no es la más
   reciente. Se debe decidir después del piloto si migrar todo el proyecto a
   Python 3.13, mantener 0.35 o sustituir solo la capa web.
-- Exponer la MacBook requiere elegir túnel/proxy, dominio, supervisor y política
-  de actualización antes de invitar evaluadores.
-- La cola y el rate limit son locales y se reinician con el proceso; son
-  suficientes para un piloto de un nodo, no para varios procesos.
+- Exponer el servidor de producción requiere elegir túnel/proxy, dominio y
+  política de actualización antes de invitar evaluadores.
+- La cola y el rate limit viven en el SQLite de evaluación compartido y
+  sobreviven reinicios de cualquier proceso; siguen siendo de un solo nodo,
+  no de varias máquinas.
 - Falta incorporar una verificación mínima del MVP a GitHub Actions; se mantiene
   como trabajo posterior para no mezclar infraestructura de CI con este PR.
 - Deben fijarse presupuesto por modelo, timeout efectivo y respuesta ante cuota
