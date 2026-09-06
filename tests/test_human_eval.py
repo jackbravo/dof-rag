@@ -28,6 +28,7 @@ from human_eval.app import (
 from human_eval.auth import FakeAuthBackend, User
 from human_eval.contracts import ContractError, FeedbackRequest, RunRequest
 from human_eval.markdown_render import render_markdown_html
+from human_eval.scheduler import RunScheduler
 from human_eval.service import (
     ActiveRunError,
     EvaluationService,
@@ -118,6 +119,40 @@ def wait_for_terminal(service: EvaluationService, run_id: str) -> dict:
     raise AssertionError("run did not reach a terminal state")
 
 
+def start_scheduler(
+    store: EvaluationStore, executor, **kwargs
+) -> tuple[RunScheduler, threading.Thread]:
+    """Run a background scheduler against the store, like production."""
+    scheduler = RunScheduler(store, executor, poll_seconds=0.02, **kwargs)
+    scheduler.prepare()
+    thread = threading.Thread(
+        target=scheduler.run, name="test-scheduler", daemon=True
+    )
+    thread.start()
+    return scheduler, thread
+
+
+def stop_scheduler(scheduler: RunScheduler, thread: threading.Thread) -> None:
+    scheduler.stop()
+    thread.join(timeout=3)
+
+
+class SchedulerTestCase(unittest.TestCase):
+    """Web service plus a background scheduler against one temporary store."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.store = EvaluationStore(Path(self.tempdir.name) / "evaluation.sqlite")
+
+    def make_service(self, executor=None, **service_kwargs):
+        executor = executor or FakeExecutor()
+        harness = start_scheduler(self.store, executor)
+        self.addCleanup(stop_scheduler, *harness)
+        service = EvaluationService(self.store, **service_kwargs)
+        service.start()
+        self.addCleanup(service.close)
+        return service, executor
 class ContractTests(unittest.TestCase):
     def test_run_request_validates_and_normalizes(self):
         request = RunRequest.from_dict(
@@ -811,53 +846,41 @@ class StoreTests(unittest.TestCase):
         self.assertNotEqual(first["run_id"], third["run_id"])
 
 
-class ServiceTests(unittest.TestCase):
-    def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.store = EvaluationStore(Path(self.tempdir.name) / "evaluation.sqlite")
-
-    def tearDown(self):
-        self.tempdir.cleanup()
-
-    def test_worker_persists_success_and_provenance(self):
-        executor = FakeExecutor()
-        service = EvaluationService(self.store, executor, executor.provenance)
-        service.start()
-        try:
-            created = service.submit(
-                RunRequest("pregunta válida", client_request_id="request-1"),
+class ServiceTests(SchedulerTestCase):
+    def test_run_persists_success_and_provenance(self):
+        service, _ = self.make_service()
+        created = service.submit(
+            RunRequest("pregunta válida", client_request_id="request-1"),
+            user_id="evaluator",
+            admin=True,
+        )
+        finished = wait_for_terminal(service, created["run_id"])
+        self.assertEqual(finished["status"], "succeeded")
+        self.assertEqual(finished["result"]["answer"]["citation_ids"], [123])
+        self.assertEqual(
+            [event["event_type"] for event in finished["progress"]],
+            ["agent_started", "tool_completed"],
+        )
+        self.assertEqual(finished["provenance"]["code_revision"], "abc123")
+        self.assertEqual(
+            finished["events_url"], f"/runs/{created['run_id']}/events"
+        )
+        self.assertNotIn("status_url", finished)
+        self.assertNotIn("feedback_url", finished)
+        repeated = service.submit(
+            RunRequest("pregunta válida", client_request_id="request-1"),
+            user_id="evaluator",
+            admin=True,
+        )
+        self.assertEqual(repeated["run_id"], created["run_id"])
+        with self.assertRaises(IdempotencyConflictError):
+            service.submit(
+                RunRequest("otra pregunta", client_request_id="request-1"),
                 user_id="evaluator",
                 admin=True,
             )
-            finished = wait_for_terminal(service, created["run_id"])
-            self.assertEqual(finished["status"], "succeeded")
-            self.assertEqual(finished["result"]["answer"]["citation_ids"], [123])
-            self.assertEqual(
-                [event["event_type"] for event in finished["progress"]],
-                ["agent_started", "tool_completed"],
-            )
-            self.assertEqual(finished["provenance"]["code_revision"], "abc123")
-            self.assertEqual(
-                finished["events_url"], f"/runs/{created['run_id']}/events"
-            )
-            self.assertNotIn("status_url", finished)
-            self.assertNotIn("feedback_url", finished)
-            repeated = service.submit(
-                RunRequest("pregunta válida", client_request_id="request-1"),
-                user_id="evaluator",
-                admin=True,
-            )
-            self.assertEqual(repeated["run_id"], created["run_id"])
-            with self.assertRaises(IdempotencyConflictError):
-                service.submit(
-                    RunRequest("otra pregunta", client_request_id="request-1"),
-                    user_id="evaluator",
-                    admin=True,
-                )
-        finally:
-            service.close()
 
-    def test_worker_logs_the_private_cause_of_a_public_failure(self):
+    def test_scheduler_logs_the_private_cause_of_a_public_failure(self):
         class FailingExecutor(FakeExecutor):
             def execute(self, request, *, on_progress=None):
                 try:
@@ -867,17 +890,12 @@ class ServiceTests(unittest.TestCase):
                         "provider_unavailable", "El proveedor no está disponible."
                     ) from exc
 
-        executor = FailingExecutor()
-        service = EvaluationService(self.store, executor, executor.provenance)
-        with mock.patch("human_eval.service.LOGGER.exception") as log_exception:
-            service.start()
-            try:
-                created = service.submit(
-                    RunRequest("pregunta válida"), user_id="evaluator", admin=True
-                )
-                finished = wait_for_terminal(service, created["run_id"])
-            finally:
-                service.close()
+        with mock.patch("human_eval.scheduler.LOGGER.exception") as log_exception:
+            service, _ = self.make_service(FailingExecutor())
+            created = service.submit(
+                RunRequest("pregunta válida"), user_id="evaluator", admin=True
+            )
+            finished = wait_for_terminal(service, created["run_id"])
 
         self.assertEqual(finished["status"], "failed")
         self.assertEqual(finished["error"]["code"], "provider_unavailable")
@@ -887,7 +905,7 @@ class ServiceTests(unittest.TestCase):
             "provider_unavailable",
         )
 
-    def test_submit_prepares_executor_before_snapshotting_provenance(self):
+    def test_scheduler_prepares_executor_before_snapshotting_provenance(self):
         class PreparingExecutor(FakeExecutor):
             def __init__(self):
                 self.prepared = False
@@ -900,179 +918,71 @@ class ServiceTests(unittest.TestCase):
                 provenance["vector_used"] = self.prepared
                 return provenance
 
-        executor = PreparingExecutor()
-        service = EvaluationService(self.store, executor, executor.provenance)
-        service.start()
-        try:
-            created = service.submit(
-                RunRequest("pregunta híbrida"), user_id="evaluator", admin=True
-            )
-            self.assertTrue(
-                service.public_run(created["run_id"], admin=True)["provenance"][
-                    "vector_used"
-                ]
-            )
-        finally:
-            service.close()
+        service, executor = self.make_service(PreparingExecutor())
+        self.assertTrue(executor.prepared)
+        created = service.submit(
+            RunRequest("pregunta híbrida"), user_id="evaluator", admin=True
+        )
+        finished = wait_for_terminal(service, created["run_id"])
+        self.assertTrue(finished["provenance"]["vector_used"])
 
     def test_only_one_active_run_per_evaluator(self):
-        executor = BlockingExecutor()
-        service = EvaluationService(self.store, executor, executor.provenance)
-        service.start()
-        try:
+        service, executor = self.make_service(BlockingExecutor())
+        service.submit(
+            RunRequest("primera pregunta"), user_id="evaluator", admin=True
+        )
+        self.assertTrue(executor.started.wait(timeout=1))
+        with self.assertRaises(ActiveRunError):
             service.submit(
-                RunRequest("primera pregunta"), user_id="evaluator", admin=True
+                RunRequest("segunda pregunta"), user_id="evaluator", admin=True
             )
-            self.assertTrue(executor.started.wait(timeout=1))
-            with self.assertRaises(ActiveRunError):
-                service.submit(
-                    RunRequest("segunda pregunta"), user_id="evaluator", admin=True
-                )
-            executor.release.set()
-            service.queue.join()
-        finally:
-            executor.release.set()
-            service.close()
+        executor.release.set()
 
     def test_queue_full_rejection_is_logged(self):
-        executor = BlockingExecutor()
-        service = EvaluationService(
-            self.store, executor, executor.provenance, queue_capacity=1
+        service, executor = self.make_service(BlockingExecutor(), queue_capacity=1)
+        service.submit(
+            RunRequest("primera", client_request_id="q1"),
+            user_id="u1",
+            admin=True,
         )
-        service.start()
-        try:
-            service.submit(
-                RunRequest("primera", client_request_id="q1"),
-                user_id="u1",
-                admin=True,
-            )
-            self.assertTrue(executor.started.wait(timeout=3))
-            service.submit(
-                RunRequest("segunda", client_request_id="q2"),
-                user_id="u2",
-                admin=True,
-            )
-            with self.assertLogs("human_eval.service", level="WARNING") as captured:
-                with self.assertRaises(QueueFullError):
-                    service.submit(
-                        RunRequest("tercera", client_request_id="q3"),
-                        user_id="u3",
-                        admin=True,
-                    )
-            self.assertIn("queue full", captured.output[0])
-            self.assertIn("capacity=1", captured.output[0])
-        finally:
-            executor.release.set()
-            service.close()
+        self.assertTrue(executor.started.wait(timeout=3))
+        service.submit(
+            RunRequest("segunda", client_request_id="q2"),
+            user_id="u2",
+            admin=True,
+        )
+        with self.assertLogs("human_eval.service", level="WARNING") as captured:
+            with self.assertRaises(QueueFullError):
+                service.submit(
+                    RunRequest("tercera", client_request_id="q3"),
+                    user_id="u3",
+                    admin=True,
+                )
+        self.assertIn("queue full", captured.output[0])
+        self.assertIn("capacity=1", captured.output[0])
+        executor.release.set()
 
     def test_active_run_rejection_is_logged_without_user_id(self):
-        executor = BlockingExecutor()
-        service = EvaluationService(
-            self.store, executor, executor.provenance, queue_capacity=2
+        service, executor = self.make_service(BlockingExecutor(), queue_capacity=2)
+        service.submit(
+            RunRequest("primera", client_request_id="active-1"),
+            user_id="sensitive-user-id",
+            admin=True,
         )
-        service.start()
-        try:
-            service.submit(
-                RunRequest("primera", client_request_id="active-1"),
-                user_id="sensitive-user-id",
-                admin=True,
-            )
-            self.assertTrue(executor.started.wait(timeout=3))
-            with self.assertLogs("human_eval.service", level="WARNING") as captured:
-                with self.assertRaises(ActiveRunError):
-                    service.submit(
-                        RunRequest("segunda", client_request_id="active-2"),
-                        user_id="sensitive-user-id",
-                        admin=True,
-                    )
-            message = captured.output[0]
-            self.assertIn("active run exists", message)
-            self.assertIn("depth=0", message)
-            self.assertIn("capacity=2", message)
-            self.assertNotIn("sensitive-user-id", message)
-        finally:
-            executor.release.set()
-            service.close()
-
-    def test_close_runs_the_executor_shutdown_hook(self):
-        class ClosingExecutor(FakeExecutor):
-            def __init__(self):
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        executor = ClosingExecutor()
-        service = EvaluationService(self.store, executor, executor.provenance)
-        service.start()
-        service.close()
-        self.assertTrue(executor.closed)
-
-    def test_close_does_not_shutdown_executor_while_worker_is_active(self):
-        class ClosingBlockingExecutor(BlockingExecutor):
-            def __init__(self):
-                super().__init__()
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        executor = ClosingBlockingExecutor()
-        service = EvaluationService(
-            self.store,
-            executor,
-            executor.provenance,
-            shutdown_timeout=0.01,
-        )
-        service.start()
-        service.submit(RunRequest("pregunta activa"), user_id="one", admin=True)
-        self.assertTrue(executor.started.wait(timeout=1))
-        service.close()
-        self.assertFalse(executor.closed)
+        self.assertTrue(executor.started.wait(timeout=3))
+        with self.assertLogs("human_eval.service", level="WARNING") as captured:
+            with self.assertRaises(ActiveRunError):
+                service.submit(
+                    RunRequest("segunda", client_request_id="active-2"),
+                    user_id="sensitive-user-id",
+                    admin=True,
+                )
+        message = captured.output[0]
+        self.assertIn("active run exists", message)
+        self.assertIn("depth=0", message)
+        self.assertIn("capacity=2", message)
+        self.assertNotIn("sensitive-user-id", message)
         executor.release.set()
-        service.worker.join(timeout=1)
-        self.assertTrue(executor.closed)
-
-    def test_close_never_blocks_on_full_queue_or_writes_late_results(self):
-        executor = BlockingExecutor()
-        service = EvaluationService(
-            self.store,
-            executor,
-            executor.provenance,
-            queue_capacity=1,
-            shutdown_timeout=0.01,
-        )
-        service.start()
-        first = service.submit(RunRequest("primera"), user_id="one", admin=True)
-        self.assertTrue(executor.started.wait(timeout=1))
-        second = service.submit(RunRequest("segunda"), user_id="two", admin=True)
-
-        started = time.monotonic()
-        service.close()
-        service.close()
-        self.assertLess(time.monotonic() - started, 0.5)
-        executor.release.set()
-        service.worker.join(timeout=1)
-
-        self.assertEqual(
-            service.public_run(first["run_id"], admin=True)["status"], "running"
-        )
-        self.assertEqual(
-            service.public_run(second["run_id"], admin=True)["status"], "queued"
-        )
-
-        replacement = EvaluationService(
-            self.store, FakeExecutor(), lambda: dict(PROVENANCE)
-        )
-        replacement.start()
-        try:
-            recovered_first = service.public_run(first["run_id"], admin=True)
-            recovered_second = wait_for_terminal(replacement, second["run_id"])
-            self.assertEqual(recovered_first["status"], "failed")
-            self.assertEqual(recovered_first["error"]["code"], "service_restarted")
-            self.assertEqual(recovered_second["status"], "succeeded")
-        finally:
-            replacement.close()
 
 
 class AirAppTestCase(unittest.TestCase):
@@ -1083,7 +993,11 @@ class AirAppTestCase(unittest.TestCase):
         self.db_path = Path(self.tempdir.name) / "evaluation.sqlite"
         store = EvaluationStore(self.db_path)
         self.executor = FakeExecutor()
-        self.service = EvaluationService(store, self.executor, self.executor.provenance)
+        # Web service admits and reads; a background scheduler executes.
+        self.scheduler, self.scheduler_thread = start_scheduler(
+            store, self.executor
+        )
+        self.service = EvaluationService(store)
         self.settings = WebSettings(
             host="127.0.0.1",
             port=0,
@@ -1102,6 +1016,7 @@ class AirAppTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
+        stop_scheduler(self.scheduler, self.scheduler_thread)
         self.tempdir.cleanup()
 
     @staticmethod
@@ -1721,7 +1636,7 @@ class LoginPageTests(AirAppTestCase):
             session_secret="test-session-secret-that-is-at-least-32-bytes",
         )
         store = EvaluationStore(self.db_path)
-        service = EvaluationService(store, self.executor, self.executor.provenance)
+        service = EvaluationService(store)
         app = create_app(
             service,
             settings,

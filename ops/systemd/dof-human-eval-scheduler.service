@@ -1,0 +1,28 @@
+[Unit]
+Description=DOF human-evaluation scheduler (singleton model executor)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# The scheduler executes every agent run and owns the embedding server.
+# Only one scheduler may run per evaluation database; it enforces the
+# singleton itself with an flock next to the database and exits
+# immediately if another scheduler or the seed script holds it.
+ExecStart=@DOF_REPO_DIR@/.venv/bin/python -m human_eval.scheduler
+WorkingDirectory=@DOF_REPO_DIR@
+EnvironmentFile=-@DOF_REPO_DIR@/.env
+# Restart is the recovery mechanism: on startup the scheduler fails every
+# run left 'started' by the previous lifetime and resumes queued work.
+Restart=always
+RestartSec=2
+# SIGTERM stops new claims and lets in-flight runs finish within this
+# window; systemd then SIGKILLs the whole control group, including the
+# embedding-server child process.
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=append:@DOF_REPO_DIR@/logs/human-eval-scheduler.log
+StandardError=append:@DOF_REPO_DIR@/logs/human-eval-scheduler.error.log
+
+[Install]
+WantedBy=default.target

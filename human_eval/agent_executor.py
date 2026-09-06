@@ -56,6 +56,7 @@ class AgentExecutorConfig:
     reasoning_effort: str | None = "low"
     max_model_turns: int = 8
     max_tool_calls: int = 8
+    model_concurrency: int = 1
     retrieval_mode: str = "lexical"
     base_url: str | None = None
 
@@ -100,6 +101,9 @@ class AgentExecutorConfig:
         embed_port = int(os.environ.get("DOF_EMBED_PORT", "8086"))
         if not 1 <= embed_port <= 65535:
             raise ValueError("DOF_EMBED_PORT must be between 1 and 65535")
+        model_concurrency = int(os.environ.get("DOF_MODEL_CONCURRENCY", "1"))
+        if model_concurrency < 1:
+            raise ValueError("DOF_MODEL_CONCURRENCY must be positive")
         base_url = os.environ.get("DOF_AGENT_BASE_URL")
         if provider == "llama-server" and retrieval_mode != "lexical":
             host, agent_port = _endpoint_port(
@@ -126,6 +130,7 @@ class AgentExecutorConfig:
             reasoning_effort=os.environ.get("DOF_REASONING_EFFORT", "low") or None,
             max_model_turns=int(os.environ.get("DOF_MAX_MODEL_TURNS", "8")),
             max_tool_calls=int(os.environ.get("DOF_MAX_TOOL_CALLS", "8")),
+            model_concurrency=model_concurrency,
             retrieval_mode=retrieval_mode,
             base_url=base_url,
         )
@@ -186,6 +191,34 @@ def _read_index_versions(config: AgentExecutorConfig) -> dict[str, Any]:
     }
 
 
+def provenance_for_config(
+    config: AgentExecutorConfig, *, vector_used: bool = False
+) -> dict[str, Any]:
+    """Provenance derivable from configuration alone (no executor needed).
+
+    Web processes use this for the capabilities endpoint; the scheduler's
+    executor delegates with the live embedder state when stamping runs.
+    """
+    revision, dirty = _git_snapshot(config.repo_root)
+    return {
+        "code_revision": revision,
+        "code_dirty": dirty,
+        **_read_index_versions(config),
+        # vector_available describes the on-disk asset; vector_used records
+        # whether the executor could actually query it (embedder is live).
+        "vector_used": vector_used,
+        "provider": config.provider,
+        "model": config.model,
+        "configuration": {
+            "retrieval_mode": config.retrieval_mode,
+            "max_model_turns": config.max_model_turns,
+            "max_tool_calls": config.max_tool_calls,
+            "model_concurrency": config.model_concurrency,
+            "reasoning_effort": config.reasoning_effort,
+        },
+    }
+
+
 class AgentRunExecutor:
     """Run the agent, sharing one llama-server for query embeddings.
 
@@ -235,23 +268,9 @@ class AgentRunExecutor:
                 self._embedder = None
 
     def provenance(self) -> dict[str, Any]:
-        revision, dirty = _git_snapshot(self.config.repo_root)
-        return {
-            "code_revision": revision,
-            "code_dirty": dirty,
-            **_read_index_versions(self.config),
-            # vector_available describes the on-disk asset; vector_used records
-            # whether this executor can actually query it (embedder is live).
-            "vector_used": self._embedder is not None,
-            "provider": self.config.provider,
-            "model": self.config.model,
-            "configuration": {
-                "retrieval_mode": self.config.retrieval_mode,
-                "max_model_turns": self.config.max_model_turns,
-                "max_tool_calls": self.config.max_tool_calls,
-                "reasoning_effort": self.config.reasoning_effort,
-            },
-        }
+        return provenance_for_config(
+            self.config, vector_used=self._embedder is not None
+        )
 
     def _backend(self) -> Any:
         if self.config.provider == "llama-server":

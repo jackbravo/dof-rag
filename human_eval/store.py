@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,22 @@ PROGRESS_EVENT_TYPES = frozenset(
         "verification_completed",
     }
 )
+
+class ActiveRunConflict(RuntimeError):
+    """The user already has a queued or running execution."""
+
+
+class QueueCapacityConflict(RuntimeError):
+    """The shared persistent queue has reached its configured capacity."""
+
+
+class DailyQuotaConflict(RuntimeError):
+    """The user has reached the configured rolling question limit."""
+
+
+class IdempotencyPayloadConflict(RuntimeError):
+    """An idempotency key was reused for a different request payload."""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -164,28 +181,101 @@ class EvaluationStore:
                 "ALTER TABLE feedback RENAME COLUMN evaluator_hash TO user_id"
             )
 
+    def validate_schema(self) -> None:
+        """Verify the database is initialized at the current schema version.
+
+        Web processes never migrate: the scheduler (or the seed script, under
+        the same execution lock) is the only component allowed to initialize
+        or upgrade the database, so startup ordering never races a migration.
+        """
+        if not self.path.exists():
+            raise RuntimeError(
+                f"evaluation database {self.path} does not exist; "
+                "start the scheduler once to initialize it"
+            )
+        with self._connect() as connection:
+            try:
+                row = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise RuntimeError(
+                    f"evaluation database {self.path} is not initialized"
+                ) from exc
+        if row is None or row[0] != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported evaluation schema "
+                f"{None if row is None else row[0]!r}; expected {SCHEMA_VERSION} "
+                "(the scheduler migrates the database on startup)"
+            )
+
     def create_run(
         self,
         request: RunRequest,
         *,
         user_id: str,
-        provenance: dict[str, Any],
+        provenance: dict[str, Any] | None = None,
+        enforce_active_run: bool = False,
+        queue_capacity: int | None = None,
+        daily_question_limit: int | None = None,
+        daily_since: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if daily_question_limit is not None and daily_question_limit < 1:
+            raise ValueError("daily_question_limit must be positive")
+        if daily_question_limit is not None and daily_since is None:
+            raise ValueError("daily_since is required with daily_question_limit")
+        if queue_capacity is not None and queue_capacity < 1:
+            raise ValueError("queue_capacity must be positive")
         created_at = utc_now()
         run_id = str(uuid.uuid4())
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if request.client_request_id:
                 existing = connection.execute(
-                    "SELECT run_id FROM runs WHERE user_id = ? "
+                    "SELECT run_id, question, as_of, required_hops FROM runs "
+                    "WHERE user_id = ? "
                     "AND client_request_id = ?",
                     (user_id, request.client_request_id),
                 ).fetchone()
                 if existing:
+                    if any(
+                        (
+                            existing["question"] != request.question,
+                            existing["as_of"] != request.as_of,
+                            existing["required_hops"] != request.required_hops,
+                        )
+                    ):
+                        raise IdempotencyPayloadConflict(request.client_request_id)
                     connection.commit()
-                    found = self.get_run(existing[0])
+                    found = self.get_run(existing["run_id"])
                     assert found is not None
                     return found, False
+            if enforce_active_run:
+                active = connection.execute(
+                    "SELECT 1 FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                    "WHERE r.user_id = ? AND e.sequence = "
+                    "(SELECT MAX(e2.sequence) FROM run_events e2 "
+                    "WHERE e2.run_id = r.run_id) "
+                    "AND e.event_type IN ('queued', 'started') LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if active:
+                    raise ActiveRunConflict(user_id)
+            if daily_question_limit is not None:
+                submissions = connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE user_id = ? AND created_at >= ?",
+                    (user_id, daily_since),
+                ).fetchone()[0]
+                if int(submissions) >= daily_question_limit:
+                    raise DailyQuotaConflict(daily_question_limit)
+            if queue_capacity is not None:
+                queued = connection.execute(
+                    "SELECT COUNT(*) FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                    "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                    "WHERE e2.run_id = r.run_id) AND e.event_type = 'queued'"
+                ).fetchone()[0]
+                if int(queued) >= queue_capacity:
+                    raise QueueCapacityConflict(queue_capacity)
             connection.execute(
                 "INSERT INTO runs(run_id, created_at, question, as_of, required_hops, "
                 "user_id, client_request_id, provenance_json) "
@@ -198,7 +288,7 @@ class EvaluationStore:
                     request.required_hops,
                     user_id,
                     request.client_request_id,
-                    _json(provenance),
+                    _json(provenance or {}),
                 ),
             )
             connection.execute(
@@ -209,6 +299,179 @@ class EvaluationStore:
         found = self.get_run(run_id)
         assert found is not None
         return found, True
+
+    def queue_depth(self) -> int:
+        """Runs currently waiting for the scheduler."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                "WHERE e2.run_id = r.run_id) AND e.event_type = 'queued'"
+            ).fetchone()
+        return int(row[0])
+
+    def model_activity(self, capacity: int) -> dict[str, int]:
+        """Active executions (latest event 'started') against the capacity.
+
+        Only the scheduler starts runs, so the count of started runs is the
+        exact in-flight number; ``capacity`` is the scheduler's configured
+        model concurrency, mirrored in the web process for display only.
+        """
+        if capacity < 1:
+            raise ValueError("capacity must be positive")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                "WHERE e2.run_id = r.run_id) AND e.event_type = 'started'"
+            ).fetchone()
+        active = int(row[0])
+        return {
+            "active": active,
+            "capacity": capacity,
+            "available": max(0, capacity - active),
+        }
+
+    def claim_next_run(self, *, provenance: dict[str, Any]) -> str | None:
+        """Atomically start the oldest queued run, stamping its provenance.
+
+        The singleton scheduler is the only caller, so no fencing is needed;
+        the transaction still keeps the claim atomic against web readers.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT r.run_id FROM runs r JOIN run_events e ON e.run_id = r.run_id "
+                "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
+                "WHERE e2.run_id = r.run_id) AND e.event_type = 'queued' "
+                "ORDER BY r.created_at, r.run_id LIMIT 1"
+            ).fetchone()
+            if run is None:
+                return None
+            run_id = str(run[0])
+            self._start_run_in_connection(connection, run_id, provenance)
+        return run_id
+
+    def start_run(self, run_id: str, *, provenance: dict[str, Any]) -> bool:
+        """Start one specific queued run (used by the seed script)."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                "SELECT event_type FROM run_events WHERE run_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if latest is None:
+                raise KeyError(run_id)
+            if latest[0] != "queued":
+                return False
+            self._start_run_in_connection(connection, run_id, provenance)
+        return True
+
+    @staticmethod
+    def _start_run_in_connection(
+        connection: sqlite3.Connection, run_id: str, provenance: dict[str, Any]
+    ) -> None:
+        """Stamp provenance and append 'started' in the caller's transaction."""
+        connection.execute(
+            "UPDATE runs SET provenance_json = ? WHERE run_id = ?",
+            (_json(provenance), run_id),
+        )
+        current = connection.execute(
+            "SELECT sequence FROM run_events WHERE run_id = ? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if current is None:
+            raise KeyError(run_id)
+        connection.execute(
+            "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+            "VALUES (?, ?, 'started', ?, '{}')",
+            (run_id, int(current[0]) + 1, utc_now()),
+        )
+
+    def fail_interrupted_runs(self) -> int:
+        """Fail every run left 'started' by a previous scheduler lifetime.
+
+        Only the scheduler executes runs, so at scheduler startup (under the
+        execution lock) any started run is provably orphaned.
+        """
+        recovered = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            runs = connection.execute(
+                "SELECT r.run_id, e.sequence FROM runs r JOIN run_events e "
+                "ON e.run_id = r.run_id WHERE e.sequence = (SELECT MAX(e2.sequence) "
+                "FROM run_events e2 WHERE e2.run_id = r.run_id) "
+                "AND e.event_type = 'started'"
+            ).fetchall()
+            now = utc_now()
+            for run in runs:
+                connection.execute(
+                    "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                    "VALUES (?, ?, 'failed', ?, ?)",
+                    (
+                        str(run[0]),
+                        int(run[1]) + 1,
+                        now,
+                        _json(
+                            {
+                                "code": "service_restarted",
+                                "message": "La ejecución se interrumpió antes de terminar.",
+                            }
+                        ),
+                    ),
+                )
+                recovered += 1
+        return recovered
+
+    def queue_position(self, run_id: str) -> int | None:
+        """1-based FIFO position among queued runs; None when not queued."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT r.created_at FROM runs r WHERE r.run_id = ? AND "
+                "(SELECT e.event_type FROM run_events e WHERE e.run_id = r.run_id "
+                "ORDER BY e.sequence DESC LIMIT 1) = 'queued'",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            ahead = connection.execute(
+                "SELECT COUNT(*) FROM runs r WHERE "
+                "(SELECT e.event_type FROM run_events e WHERE e.run_id = r.run_id "
+                "ORDER BY e.sequence DESC LIMIT 1) = 'queued' AND "
+                "(r.created_at < ? OR (r.created_at = ? AND r.run_id < ?))",
+                (row["created_at"], row["created_at"], run_id),
+            ).fetchone()
+        return int(ahead[0]) + 1
+
+    def recent_durations(self, *, limit: int = 10) -> list[float]:
+        """Inference seconds (started -> terminal) of recent finished runs."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT started.created_at AS started_at, "
+                "finished.created_at AS finished_at "
+                "FROM run_events started "
+                "JOIN run_events finished ON finished.run_id = started.run_id "
+                "AND finished.sequence = started.sequence + 1 "
+                "WHERE started.event_type = 'started' "
+                "AND finished.event_type IN ('succeeded', 'failed') "
+                "ORDER BY finished.created_at DESC, finished.run_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        durations: list[float] = []
+        for row in rows:
+            try:
+                began = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+                ended = datetime.fromisoformat(
+                    row["finished_at"].replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                continue
+            durations.append(max(0.0, (ended - began).total_seconds()))
+        return durations
 
     def find_idempotent_run(
         self, user_id: str, client_request_id: str | None
@@ -669,16 +932,6 @@ class EvaluationStore:
             for table in ("run_progress", "run_events", "feedback", "runs"):
                 connection.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
         return True
-
-    def unfinished_runs(self) -> list[tuple[str, str]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT r.run_id, e.event_type FROM runs r "
-                "JOIN run_events e ON e.run_id = r.run_id "
-                "WHERE e.sequence = (SELECT MAX(e2.sequence) FROM run_events e2 "
-                "WHERE e2.run_id = r.run_id) AND e.event_type IN ('queued', 'started')"
-            ).fetchall()
-        return [(row[0], row[1]) for row in rows]
 
     def feedback_for_run(self, run_id: str) -> list[dict[str, Any]]:
         """Administrative/test helper listing who evaluated the run and how."""

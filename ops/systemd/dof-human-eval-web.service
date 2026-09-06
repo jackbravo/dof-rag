@@ -1,0 +1,20 @@
+[Unit]
+Description=DOF human-evaluation web app (admission and UI)
+Wants=network-online.target
+After=network-online.target dof-human-eval-scheduler.service
+
+[Service]
+Type=simple
+# Web workers only admit and read runs; the scheduler process executes
+# them. Start the scheduler first so it initializes/migrates the database
+# before web workers validate it.
+ExecStart=@DOF_REPO_DIR@/.venv/bin/python -m human_eval.app --workers 2
+WorkingDirectory=@DOF_REPO_DIR@
+EnvironmentFile=-@DOF_REPO_DIR@/.env
+Restart=always
+RestartSec=2
+StandardOutput=append:@DOF_REPO_DIR@/logs/human-eval-web.log
+StandardError=append:@DOF_REPO_DIR@/logs/human-eval-web.error.log
+
+[Install]
+WantedBy=default.target

@@ -157,9 +157,27 @@ se rechazan admisiones antes de construir esa maquinaria. Quedan pendientes de
 este apartado los timeouts por turno y por corrida, la detección del modelo
 caído antes de admitir y la pausa administrativa de admisión.
 
-Leases, reclamo atómico entre procesos y una base distinta a SQLite serán
-necesarios si llegamos a operar varios workers. No hacen falta para la primera
-beta en una sola máquina.
+**Avance de septiembre de 2026.** La admisión quedó dividida en dos procesos:
+los procesos web sólo encolan y leen, y un scheduler singleton ejecuta. La
+admisión (una ejecución activa por evaluador, cuota diaria, capacidad de cola
+e idempotencia con validación de payload) ocurre en una transacción SQLite
+compartida por todos los procesos web. El scheduler protege su exclusividad
+con un seguro `flock`, estampa la procedencia real al iniciar cada corrida,
+acota la concurrencia del modelo con un pool local (`DOF_MODEL_CONCURRENCY`) y,
+al arrancar, marca como interrumpidas las ejecuciones `started` de la vida
+anterior. La interfaz ya muestra posición en cola, espera aproximada y slots
+ocupados, y el 503 de cola llena incluye `Retry-After`. Los procesos web pueden
+multiplicarse (`--workers N`) sin multiplicar la concurrencia del modelo, y la
+semilla toma el mismo seguro del scheduler para no violar el singleton.
+Siguen pendientes los timeouts por turno y por corrida, la detección del
+modelo caído antes de admitir y la pausa administrativa.
+
+Descartamos los leases entre procesos tras una primera implementación: el
+protocolo de liveness distribuido (heartbeats, fencing, recuperación por
+expiración) resultó desproporcionado para una sola máquina y concentraba todos
+los casos borde. El scheduler singleton con reinicio supervisado obtiene la
+misma recuperación sin esa maquinaria. Una base distinta a SQLite sólo haría
+falta para varios nodos.
 
 ### 4. Preparar una beta que podamos operar
 

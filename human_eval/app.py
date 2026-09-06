@@ -45,7 +45,7 @@ from starlette.responses import (
     StreamingResponse,
 )
 
-from .agent_executor import AgentExecutorConfig, AgentRunExecutor
+from .agent_executor import AgentExecutorConfig, provenance_for_config
 from .auth import AuthBackend, User
 from .contracts import ContractError, FeedbackRequest, RunRequest
 from .markdown_render import render_markdown_html
@@ -53,7 +53,6 @@ from .service import (
     ActiveRunError,
     EvaluationService,
     IdempotencyConflictError,
-    PublicExecutionError,
     QueueFullError,
     QuotaExceededError,
     ReviewRequiredError,
@@ -98,6 +97,7 @@ class WebSettings:
     session_max_age: int = 12 * 60 * 60
     daily_question_limit: int = 1
     queue_capacity: int = 20
+    model_concurrency: int = 1
 
     @classmethod
     def from_env(cls, repo_root: Path) -> "WebSettings":
@@ -128,6 +128,9 @@ class WebSettings:
             ),
             daily_question_limit=int(os.environ.get("DOF_DAILY_QUESTION_LIMIT", "1")),
             queue_capacity=int(os.environ.get("DOF_QUEUE_CAPACITY", "20")),
+            # Display-only mirror of the scheduler's real limit; share one
+            # environment file so both sides normally agree.
+            model_concurrency=int(os.environ.get("DOF_MODEL_CONCURRENCY", "1")),
         )
 
 
@@ -440,6 +443,10 @@ STREAM_SCRIPT = """
     if (!streamUrl) return;
     const list = node.querySelector('[data-progress-list]');
     const state = node.querySelector('[data-stream-state]');
+    const clearQueueStatus = () => {
+      const queueStatus = node.querySelector('[data-queue-status]');
+      if (queueStatus) queueStatus.remove();
+    };
     let last = Number(node.dataset.lastEventId || 0);
     if (!window.EventSource) {
       state.textContent = 'Actualizando el estado…';
@@ -454,8 +461,19 @@ STREAM_SCRIPT = """
       const event = JSON.parse(message.data);
       last = Math.max(last, Number(event.sequence || 0));
       node.dataset.lastEventId = last;
+      clearQueueStatus();
       appendProgress(list, event);
       state.textContent = 'Recibiendo actividad en vivo';
+    });
+    source.addEventListener('running', () => {
+      clearQueueStatus();
+      state.textContent = 'El modelo está procesando la pregunta';
+    });
+    source.addEventListener('queue', (message) => {
+      const event = JSON.parse(message.data);
+      const queueStatus = node.querySelector('[data-queue-status]');
+      if (queueStatus) queueStatus.textContent = event.message || 'Actualizando la cola…';
+      state.textContent = 'Esperando capacidad del modelo';
     });
     source.addEventListener('terminal', async () => {
       source.close();
@@ -642,13 +660,30 @@ def _status_fragment(
     if state in ACTIVE_STATES:
         progress = run.get("progress", [])
         last_event_id = progress[-1]["sequence"] if progress else 0
+        queue_note = ""
+        if state == "queued" and run.get("queue_position") is not None:
+            wait = run.get("estimated_wait_seconds")
+            wait_text = f" · {_queue_wait_text(wait)}" if wait is not None else ""
+            snapshot = run.get("queue_snapshot", {})
+            active = snapshot.get("active")
+            capacity = snapshot.get("capacity")
+            capacity_text = (
+                f" · {active} de {capacity} slots ocupados"
+                if active is not None and capacity is not None
+                else ""
+            )
+            queue_note = (
+                f'<p class="meta" data-queue-status>Posición en la cola: '
+                f'{_escape(run["queue_position"])}{_escape(wait_text)}'
+                f'{_escape(capacity_text)}</p>'
+            )
         return f"""<section id="run-status" class="panel status" data-state="{state}"
 data-stream-url="/runs/{_escape(run["run_id"])}/events"
 data-status-url="/runs/{_escape(run["run_id"])}/status"
 data-last-event-id="{_escape(last_event_id)}" aria-live="polite">
 <p class="eyebrow">{_escape(STATUS_LABELS[state])}</p><h2>La ejecución sigue en progreso</h2>
 <p>Registro público de decisiones: qué intenta localizar, por qué consulta cada fuente y qué evidencia encuentra.</p>
-<p class="stream-state meta" data-stream-state>Conectando al trabajo del agente…</p>
+<p class="stream-state meta" data-stream-state>Conectando al trabajo del agente…</p>{queue_note}
 {_progress_timeline(progress)}{meta}</section>"""
     if state == "failed":
         error = run.get("error", {})
@@ -825,6 +860,36 @@ def _attach_chunk_html(event: dict[str, Any]) -> None:
         excerpt = chunk.get("excerpt") or chunk.get("snippet") or ""
         if excerpt:
             chunk["excerpt_html"] = render_markdown_html(excerpt)
+
+
+def _queue_wait_text(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "Espera aproximada: calculando…"
+    if seconds < 60:
+        return "Espera aproximada: menos de 1 min"
+    return f"Espera aproximada: {round(seconds / 60)} min"
+
+
+def _queue_status_event(
+    run: dict[str, Any],
+) -> tuple[tuple[int, int, int], str] | None:
+    """Build a queue update only from one complete public-run snapshot."""
+    if run.get("status") != "queued":
+        return None
+    position = run.get("queue_position")
+    snapshot = run.get("queue_snapshot", {})
+    active = snapshot.get("active")
+    capacity = snapshot.get("capacity")
+    if position is None or active is None or capacity is None:
+        return None
+    queue_state = (int(position), int(active), int(capacity))
+    wait_text = _queue_wait_text(run.get("estimated_wait_seconds"))
+    message = (
+        f"Posición en la cola: {queue_state[0]} · "
+        f"{wait_text} · "
+        f"{queue_state[1]} de {queue_state[2]} slots ocupados"
+    )
+    return queue_state, message
 
 
 def _feedback_form(run_id: str, csrf_token: str, *, next_url: str) -> str:
@@ -1082,6 +1147,7 @@ def create_app(
         error: str | None = None,
         values: dict[str, Any] | None = None,
         status_code: int = 200,
+        headers: dict[str, str] | None = None,
     ) -> HTMLResponse:
         published = service.store.published_runs()
         my_runs = None
@@ -1120,6 +1186,7 @@ def create_app(
                 page_scripts=page_scripts,
             ),
             status_code=status_code,
+            headers=headers,
         )
 
     @app.get("/login", response_class=HTMLResponse)
@@ -1248,17 +1315,10 @@ def create_app(
             return render_home(
                 request,
                 user,
-                error="La cola local está llena; intenta más tarde.",
+                error="La cola de preguntas está llena; intenta más tarde.",
                 values=values,
                 status_code=503,
-            )
-        except PublicExecutionError as exc:
-            return render_home(
-                request,
-                user,
-                error=str(exc),
-                values=values,
-                status_code=503,
+                headers={"Retry-After": str(service.queue_retry_after())},
             )
         return RedirectResponse(f"/runs/{run['run_id']}", status_code=303)
 
@@ -1394,6 +1454,8 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
         async def event_stream() -> AsyncIterator[str]:
             cursor = after
             heartbeat_at = time.monotonic()
+            last_queue_state: tuple[int, int, int] | None = None
+            running_announced = False
             while True:
                 events = await asyncio.to_thread(
                     service.store.progress_for_run, run_id, after=cursor
@@ -1407,6 +1469,19 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
                 run = await asyncio.to_thread(
                     service.public_run, run_id, user_id=user.id, admin=True
                 )
+                if run["status"] == "queued":
+                    queue_event = _queue_status_event(run)
+                    if queue_event is not None:
+                        queue_state, message = queue_event
+                        if queue_state != last_queue_state:
+                            last_queue_state = queue_state
+                            yield (
+                                "event: queue\n"
+                                f"data: {json.dumps({'message': message}, ensure_ascii=False)}\n\n"
+                            )
+                elif run["status"] == "running" and not running_announced:
+                    running_announced = True
+                    yield 'event: running\ndata: {"status":"running"}\n\n'
                 if run["status"] not in ACTIVE_STATES:
                     data = json.dumps({"status": run["status"]}, separators=(",", ":"))
                     yield f"event: terminal\ndata: {data}\n\n"
@@ -1564,6 +1639,8 @@ Publicada: {_escape(run.get("published_at"))}</p></section>
                     "required_hops": 5,
                     "questions_per_day": settings.daily_question_limit,
                     "active_runs_per_user": 1,
+                    "model_concurrency": settings.model_concurrency,
+                    "queue_capacity": settings.queue_capacity,
                 },
             }
         )
@@ -1603,17 +1680,19 @@ def build_default_app(repo_root: Path | None = None) -> tuple[Any, WebSettings]:
     from .clerk_auth import ClerkAuthBackend, clerk_login_scripts, clerk_page_scripts
 
     auth_backend = ClerkAuthBackend(secret_key=airclerk.settings.CLERK_SECRET_KEY)
-    executor = AgentRunExecutor(AgentExecutorConfig.from_env(root))
+    # Web workers never build an executor: provenance comes from the shared
+    # configuration, and the scheduler stamps the authoritative per-run
+    # provenance when it starts each execution.
+    config = AgentExecutorConfig.from_env(root)
     service = EvaluationService(
         EvaluationStore(settings.db_path),
-        executor,
-        executor.provenance,
         queue_capacity=settings.queue_capacity,
+        model_concurrency=settings.model_concurrency,
     )
     app = create_app(
         service,
         settings,
-        executor.provenance,
+        lambda: provenance_for_config(config),
         auth_backend=auth_backend,
         page_scripts=clerk_page_scripts,
         login_scripts=clerk_login_scripts,
@@ -1622,12 +1701,38 @@ def build_default_app(repo_root: Path | None = None) -> tuple[Any, WebSettings]:
     return app, settings
 
 
+def create_uvicorn_app() -> Any:
+    """Uvicorn factory so every web process builds its own app lifecycle."""
+    configured_root = os.environ.get("DOF_APP_REPO_ROOT")
+    app, _ = build_default_app(Path(configured_root) if configured_root else None)
+    return app
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve the DOF human-evaluation site")
     parser.add_argument(
         "--repo-root", type=Path, default=Path(__file__).resolve().parent.parent
     )
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    if args.workers > 1:
+        # The factory is required for Uvicorn to create the application inside
+        # each worker process. Web workers only admit and read runs; the
+        # singleton scheduler process executes them.
+        repo_root = args.repo_root.resolve()
+        settings = WebSettings.from_env(repo_root)
+        os.environ["DOF_APP_REPO_ROOT"] = str(repo_root)
+        uvicorn.run(
+            "human_eval.app:create_uvicorn_app",
+            factory=True,
+            workers=args.workers,
+            host=settings.host,
+            port=settings.port,
+            access_log=False,
+        )
+        return 0
     app, settings = build_default_app(args.repo_root)
     # Questions are stored deliberately, but client IP addresses are not part
     # of the evaluation dataset. Keep Uvicorn's per-request access log off.
