@@ -51,8 +51,11 @@ class RunExecutor(Protocol):
 
 
 def execution_lock_path(db_path: str | Path) -> Path:
-    """The singleton execution lock lives next to the evaluation database."""
-    return Path(str(db_path) + ".lock")
+    """Place the lock next to the canonical database, including symlink aliases.
+
+    Hard-link aliases and retargeting symlinks while running are unsupported.
+    """
+    return Path(str(Path(db_path).resolve()) + ".lock")
 
 
 def acquire_execution_lock(db_path: str | Path) -> int:

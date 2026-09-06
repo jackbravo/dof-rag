@@ -53,6 +53,26 @@ class ExecutionLockTests(unittest.TestCase):
         second = acquire_execution_lock(self.db_path)
         os.close(second)
 
+    def test_database_symlink_shares_execution_lock(self):
+        alias = self.db_path.with_name("alias.sqlite")
+        alias.symlink_to(self.db_path.name)
+        # Also resolve a dangling alias before SQLite creates the database.
+        for exists in (False, True):
+            with self.subTest(database_exists=exists):
+                if exists:
+                    self.db_path.touch()
+                self.assertEqual(
+                    execution_lock_path(alias), execution_lock_path(self.db_path)
+                )
+                fd = acquire_execution_lock(self.db_path)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "execution lock"):
+                        acquire_execution_lock(alias)
+                finally:
+                    os.close(fd)
+                second = acquire_execution_lock(alias)
+                os.close(second)
+
     def test_lock_fd_is_not_inheritable_by_child_processes(self):
         fd = acquire_execution_lock(self.db_path)
         try:
