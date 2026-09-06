@@ -112,7 +112,8 @@ def main() -> int:
         "--queries", type=Path, default=Path("eval/dof_queries_v4.jsonl")
     )
     parser.add_argument(
-        "--db", type=Path, default=Path("var/human_evaluation.sqlite")
+        "--db", type=Path, default=None,
+        help="evaluation database (default: DOF_HUMAN_EVAL_DB or var/human_evaluation.sqlite)",
     )
     parser.add_argument(
         "--repo-root",
@@ -140,13 +141,17 @@ def main() -> int:
         if missing:
             parser.error(f"unknown query ids: {sorted(missing)}")
 
-    store = EvaluationStore(args.db)
+    root = args.repo_root.resolve()
+    db_path = args.db or Path(
+        os.environ.get("DOF_HUMAN_EVAL_DB", root / "var/human_evaluation.sqlite")
+    )
+    store = EvaluationStore(db_path)
     # Only one process may execute runs against a database. Seeding normally
     # happens with the scheduler service stopped; the lock makes an
     # accidental overlap fail immediately instead of double-executing.
-    lock_fd = acquire_execution_lock(args.db)
+    lock_fd = acquire_execution_lock(db_path)
     store.initialize()
-    config = AgentExecutorConfig.from_env(args.repo_root)
+    config = AgentExecutorConfig.from_env(root)
     executor = AgentRunExecutor(config)
     # Pre-warm the embedding server so provenance records vector_used from the
     # first run on (the embedder otherwise starts lazily mid-run).

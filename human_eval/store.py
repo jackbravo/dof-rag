@@ -472,6 +472,8 @@ class EvaluationStore:
                 "AND finished.sequence = started.sequence + 1 "
                 "WHERE started.event_type = 'started' "
                 "AND finished.event_type IN ('succeeded', 'failed') "
+                "AND COALESCE(json_extract(finished.payload_json, '$.code'), '') "
+                "!= 'service_restarted' "
                 "ORDER BY finished.created_at DESC, finished.run_id DESC LIMIT ?",
                 (limit,),
             ).fetchall()

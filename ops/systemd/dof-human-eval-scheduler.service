@@ -7,7 +7,7 @@ After=network-online.target
 Type=simple
 # The scheduler executes every agent run and owns the embedding server.
 # Only one scheduler may run per evaluation database; it enforces the
-# singleton itself with an flock next to the database and exits
+# singleton itself with a flock next to the database and exits
 # immediately if another scheduler or the seed script holds it.
 ExecStart=@DOF_REPO_DIR@/.venv/bin/python -m human_eval.scheduler
 WorkingDirectory=@DOF_REPO_DIR@

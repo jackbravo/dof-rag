@@ -207,24 +207,24 @@ class RunScheduler:
         Single-use: an early stop request (for example SIGTERM during a slow
         ``prepare``) is honored instead of cleared.
         """
-        with ThreadPoolExecutor(
-            max_workers=self.model_concurrency,
-            thread_name_prefix="dof-human-eval-scheduler",
-        ) as self._pool:
-            try:
+        try:
+            with ThreadPoolExecutor(
+                max_workers=self.model_concurrency,
+                thread_name_prefix="dof-human-eval-scheduler",
+            ) as self._pool:
                 while not self._stopping.is_set():
                     if self.poll_once() == 0:
                         self._stopping.wait(self.poll_seconds)
-            finally:
-                self._pool = None
-        # The with-block waits for in-flight work; a hung call is bounded by
-        # the supervisor's stop timeout (systemd TimeoutStopSec + SIGKILL).
-        close = getattr(self.executor, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                LOGGER.exception("executor shutdown hook failed")
+        finally:
+            self._pool = None
+            # Drain the pool before closing the executor, even if polling raises.
+            # A hung call is bounded by the supervisor's stop timeout.
+            close = getattr(self.executor, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    LOGGER.exception("executor shutdown hook failed")
         if self._fatal is not None:
             raise RuntimeError(
                 "scheduler stopped after an execution persistence failure"
