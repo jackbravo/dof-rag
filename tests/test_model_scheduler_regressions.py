@@ -302,7 +302,10 @@ class SchedulerRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(clock[0], 1.0)
         self.assertGreater(renew.call_count, 1)
         self.assertLess(renew.call_count, 10)
-        self.assertTrue(all(0 < value <= 1 / 3 for value in waits))
+        # The first renewal happens immediately after the claim; later
+        # retries stay bounded by the heartbeat interval.
+        self.assertEqual(waits[0], 0.0)
+        self.assertTrue(all(0 < value <= 1 / 3 for value in waits[1:]))
 
     def test_heartbeat_does_not_retry_non_transient_errors(self):
         service = EvaluationService(self.store, BlockingExecutor(), lambda: {})
@@ -339,3 +342,94 @@ class SchedulerRegressionTests(unittest.TestCase):
                 run_id=run["run_id"], slot_id=1, worker_id="owner", lease_seconds=60
             )
         )
+
+    def test_heartbeat_renews_lease_immediately_after_claim(self):
+        service, executor = self.make_service(lease_seconds=30)
+        renewed = threading.Event()
+        renew = self.store.renew_model_slot
+
+        def tracking(**kwargs):
+            renewed.set()
+            return renew(**kwargs)
+
+        with mock.patch.object(self.store, "renew_model_slot", side_effect=tracking):
+            service.submit(RunRequest("question"), user_id="one", admin=True)
+            self.assertTrue(executor.started.wait(1))
+            # The first renewal must not wait a full 10 s heartbeat interval,
+            # so a stalled claim->execution gap cannot outlive the lease.
+            self.assertTrue(renewed.wait(3))
+
+    def test_progress_contention_drops_event_without_failing_run(self):
+        service, executor = self.make_service()
+        executor.release.set()
+        progress = self.store.append_progress_if_claimed
+        busy = sqlite3.OperationalError("database is locked")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        attempts = []
+
+        def fail_once(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise busy
+            return progress(*args, **kwargs)
+
+        with mock.patch.object(
+            self.store, "append_progress_if_claimed", side_effect=fail_once
+        ):
+            run = service.submit(RunRequest("question"), user_id="one", admin=True)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if self.store.get_run(run["run_id"])["status"] == "succeeded":
+                    break
+                time.sleep(0.01)
+        self.assertEqual(self.store.get_run(run["run_id"])["status"], "succeeded")
+        self.assertEqual(len(attempts), 1)
+
+    def test_progress_non_transient_error_still_fails_run(self):
+        service, executor = self.make_service()
+        executor.release.set()
+        error = sqlite3.OperationalError("no such table: run_progress")
+        error.sqlite_errorcode = sqlite3.SQLITE_ERROR
+
+        with mock.patch.object(
+            self.store, "append_progress_if_claimed", side_effect=error
+        ):
+            run = service.submit(RunRequest("question"), user_id="one", admin=True)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if self.store.get_run(run["run_id"])["status"] == "failed":
+                    break
+                time.sleep(0.01)
+        record = self.store.get_run(run["run_id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"]["code"], "internal_error")
+
+    def test_terminal_write_retries_transient_busy_error(self):
+        service, executor = self.make_service()
+        executor.release.set()
+        append = self.store.append_terminal_event_if_claimed
+        busy = sqlite3.OperationalError("database is locked")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        attempts = []
+
+        def fail_once(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise busy
+            return append(*args, **kwargs)
+
+        with mock.patch.object(
+            self.store, "append_terminal_event_if_claimed", side_effect=fail_once
+        ):
+            run = service.submit(RunRequest("question"), user_id="one", admin=True)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if (
+                    self.store.get_run(run["run_id"])["status"] == "succeeded"
+                    and self.store.model_activity(1)["available"] == 1
+                ):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(self.store.get_run(run["run_id"])["status"], "succeeded")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.store.model_activity(1)["available"], 1)

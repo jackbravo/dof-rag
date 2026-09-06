@@ -1565,9 +1565,15 @@ class ServiceTests(unittest.TestCase):
             lease_seconds=0.03,
         )
         stop = mock.Mock()
-        stop.wait.return_value = True
-        service._lease_heartbeat(stop, "run-id", 1)
-        interval = stop.wait.call_args.args[0]
+        # Run two iterations: an immediate renewal, then one interval wait.
+        stop.wait.side_effect = [False, True]
+        with mock.patch.object(
+            self.store, "renew_model_slot", return_value=True
+        ) as renewal:
+            service._lease_heartbeat(stop, "run-id", 1)
+        self.assertEqual(renewal.call_count, 1)
+        first_delay, interval = (call.args[0] for call in stop.wait.call_args_list)
+        self.assertEqual(first_delay, 0.0)
         self.assertAlmostEqual(interval, 0.01)
         self.assertLess(interval, service.lease_seconds)
 

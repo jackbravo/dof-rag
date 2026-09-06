@@ -433,7 +433,7 @@ class EvaluationService:
                                     run_id,
                                     exc.code,
                                 )
-                            terminal_written = self._append_event_if_open(
+                            terminal_written = self._append_terminal_with_retry(
                                 run_id,
                                 slot_id,
                                 "failed",
@@ -441,7 +441,7 @@ class EvaluationService:
                             )
                         except Exception:
                             LOGGER.exception("human-evaluation run %s failed", run_id)
-                            terminal_written = self._append_event_if_open(
+                            terminal_written = self._append_terminal_with_retry(
                                 run_id,
                                 slot_id,
                                 "failed",
@@ -451,7 +451,7 @@ class EvaluationService:
                                 },
                             )
                         else:
-                            terminal_written = self._append_event_if_open(
+                            terminal_written = self._append_terminal_with_retry(
                                 run_id, slot_id, "succeeded", result
                             )
                     finally:
@@ -487,7 +487,9 @@ class EvaluationService:
     ) -> None:
         interval = self.lease_seconds / 3
         deadline = time.monotonic() + self.lease_seconds
-        delay = interval
+        # Renew immediately so the claim->execution gap cannot outlive a
+        # lease that a stalled worker thread never revalidated.
+        delay = 0.0
         backoff = min(0.05, interval)
         while not stop.wait(delay):
             if self._closing.is_set():
@@ -566,6 +568,45 @@ class EvaluationService:
                 return False
             return True
 
+    def _append_terminal_with_retry(
+        self,
+        run_id: str,
+        slot_id: int,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Persist a terminal result despite transient store contention.
+
+        The heartbeat is still renewing the model lease while this runs, so
+        a brief SQLITE_BUSY/SQLITE_LOCKED episode must not abandon an
+        already-finished execution. Retry within one heartbeat interval; the
+        fenced store write still rejects the result if the lease was lost.
+        """
+        delay = 0.05
+        deadline = time.monotonic() + max(1.0, self.lease_seconds / 3)
+        while True:
+            try:
+                return self._append_event_if_open(
+                    run_id, slot_id, event_type, payload
+                )
+            except sqlite3.OperationalError as exc:
+                if not _retryable_store_error(exc):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._closing.is_set():
+                    LOGGER.warning(
+                        "dropping %s event for run %s after persistent "
+                        "store contention",
+                        event_type,
+                        run_id,
+                    )
+                    return False
+                LOGGER.warning(
+                    "terminal event store busy for run %s; retrying", run_id
+                )
+                self._closing.wait(min(delay, remaining))
+                delay = min(delay * 2, 1.0)
+
     def _append_progress_if_open(
         self,
         run_id: str,
@@ -581,13 +622,25 @@ class EvaluationService:
                     run_id,
                 )
                 return
-            appended = self.store.append_progress_if_claimed(
-                run_id,
-                event_type,
-                payload,
-                slot_id=slot_id,
-                worker_id=self.worker_id,
-            )
+            try:
+                appended = self.store.append_progress_if_claimed(
+                    run_id,
+                    event_type,
+                    payload,
+                    slot_id=slot_id,
+                    worker_id=self.worker_id,
+                )
+            except sqlite3.OperationalError as exc:
+                if not _retryable_store_error(exc):
+                    raise
+                # Progress is observational; never let transient contention
+                # on it abort an otherwise healthy model execution.
+                LOGGER.warning(
+                    "dropping %s progress event for run %s after store contention",
+                    event_type,
+                    run_id,
+                )
+                return
             if appended is None:
                 LOGGER.warning(
                     "run %s no longer owns model slot %s; dropping %s progress event",
