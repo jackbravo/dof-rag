@@ -228,6 +228,7 @@ class EvaluationStore:
         queue_capacity: int | None = None,
         daily_question_limit: int | None = None,
         daily_since: str | None = None,
+        start_immediately: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         if daily_question_limit is not None and daily_question_limit < 1:
             raise ValueError("daily_question_limit must be positive")
@@ -305,6 +306,14 @@ class EvaluationStore:
                 "VALUES (?, 1, 'queued', ?, '{}')",
                 (run_id, created_at),
             )
+            if start_immediately:
+                # Maintenance executions must not be visible to schedulers
+                # between creation and their independently managed start.
+                connection.execute(
+                    "INSERT INTO run_events(run_id, sequence, event_type, created_at, payload_json) "
+                    "VALUES (?, 2, 'started', ?, '{}')",
+                    (run_id, utc_now()),
+                )
         found = self.get_run(run_id)
         assert found is not None
         return found, True
@@ -868,7 +877,9 @@ class EvaluationStore:
                 (run_id,),
             ).fetchone()
             if current is None:
-                raise KeyError(run_id)
+                # Recovery can make a run deletable before its executor
+                # returns. A deleted run is another rejected stale result.
+                return False
             claimed = connection.execute(
                 "SELECT 1 FROM model_slots WHERE slot_id = ? AND run_id = ? "
                 "AND worker_id = ? AND lease_until > ?",

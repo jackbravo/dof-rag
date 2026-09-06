@@ -6,6 +6,7 @@ import logging
 import os
 import queue
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -156,8 +157,9 @@ class EvaluationService:
                     self.queue.put_nowait(None)
                 except queue.Full:
                     break
+        deadline = time.monotonic() + self.shutdown_timeout
         for worker in self.workers:
-            worker.join(timeout=self.shutdown_timeout)
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
         if any(worker.is_alive() for worker in self.workers):
             LOGGER.warning(
                 "human-evaluation worker is still waiting for an in-flight call; "
@@ -317,8 +319,9 @@ class EvaluationService:
         average = (
             sum(durations) / len(durations) if durations else DEFAULT_RUN_SECONDS
         )
-        batches = ceil(position / self.model_concurrency)
-        return max(1, int(round(batches * average)))
+        available = self.store.model_activity(self.model_concurrency)["available"]
+        batches = ceil(max(0, position - available) / self.model_concurrency)
+        return max(0, int(round(batches * average)))
 
     def queue_retry_after(self) -> int:
         """Estimate when the next completion should free one queue place."""
@@ -436,7 +439,7 @@ class EvaluationService:
                     finally:
                         heartbeat_stop.set()
                         heartbeat.join(timeout=1)
-                        if terminal_written and not self._closing.is_set():
+                        if terminal_written:
                             self.store.release_model_slot(
                                 run_id=run_id,
                                 slot_id=slot_id,

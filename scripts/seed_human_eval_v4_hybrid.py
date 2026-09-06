@@ -66,12 +66,14 @@ def seed_live_run(
             # Do not delete a queued/running run owned by another process.
             return "pending"
     record, created = store.create_run(
-        request, user_id=SEED_USER, provenance=executor.provenance()
+        request,
+        user_id=SEED_USER,
+        provenance=executor.provenance(),
+        start_immediately=True,
     )
     if not created:
         return "skipped"
     run_id = record["run_id"]
-    store.append_event(run_id, "started")
     try:
         result = executor.execute(
             request,

@@ -672,11 +672,7 @@ def _status_fragment(
         queue_note = ""
         if state == "queued" and run.get("queue_position") is not None:
             wait = run.get("estimated_wait_seconds")
-            wait_text = (
-                f" · Espera aproximada: {max(1, round(wait / 60))} min"
-                if wait
-                else ""
-            )
+            wait_text = f" · {_queue_wait_text(wait)}" if wait is not None else ""
             snapshot = run.get("queue_snapshot", {})
             active = snapshot.get("active")
             capacity = snapshot.get("capacity")
@@ -875,6 +871,14 @@ def _attach_chunk_html(event: dict[str, Any]) -> None:
             chunk["excerpt_html"] = render_markdown_html(excerpt)
 
 
+def _queue_wait_text(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "Espera aproximada: calculando…"
+    if seconds < 60:
+        return "Espera aproximada: menos de 1 min"
+    return f"Espera aproximada: {round(seconds / 60)} min"
+
+
 def _queue_status_event(
     run: dict[str, Any],
 ) -> tuple[tuple[int, int, int], str] | None:
@@ -888,12 +892,10 @@ def _queue_status_event(
     if position is None or active is None or capacity is None:
         return None
     queue_state = (int(position), int(active), int(capacity))
-    wait_minutes = max(
-        1, round((run.get("estimated_wait_seconds") or 60) / 60)
-    )
+    wait_text = _queue_wait_text(run.get("estimated_wait_seconds"))
     message = (
         f"Posición en la cola: {queue_state[0]} · "
-        f"Espera aproximada: {wait_minutes} min · "
+        f"{wait_text} · "
         f"{queue_state[1]} de {queue_state[2]} slots ocupados"
     )
     return queue_state, message
